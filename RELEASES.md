@@ -14,6 +14,7 @@ Released on TBD (UTC).
 - Fixed `CVec::empty()` to use dangling pointer instead of null, avoiding undefined behavior in `Vec::from_raw_parts`
 
 ### Fixes
+- Fixed risk engine balance check for inverse instruments to use `cost_currency` instead of `quote_currency`
 - Fixed trade execution fills discarded with `liquidity_consumption`
 - Fixed `ExecAlgorithm` spawn quantity accounting (will now restore quantity from denied/rejected spawned orders)
 - Fixed backtest clock monotonicity with time alerts (#3384), thanks @draphi
