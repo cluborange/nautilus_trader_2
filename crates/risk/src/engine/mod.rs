@@ -631,7 +631,7 @@ impl RiskEngine {
             AccountAny::Cash(cash_account) => cash_account,
             AccountAny::Margin(_) => return true, // TODO: Determine risk controls for margin
         };
-        let free = cash_account.balance_free(Some(instrument.quote_currency()));
+        let free = cash_account.balance_free(Some(instrument.cost_currency()));
         let allow_borrowing = cash_account.allow_borrowing;
         if self.config.debug {
             log::debug!("Free cash: {free:?}");

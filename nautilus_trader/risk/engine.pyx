@@ -660,7 +660,7 @@ cdef class RiskEngine(Component):
 
         cdef bint allow_borrowing = isinstance(account, CashAccount) and account.allow_borrowing
 
-        free = account.balance_free(instrument.quote_currency)
+        free = account.balance_free(instrument.get_cost_currency())
 
         if self.debug:
             self._log.debug(f"Free: {free!r}", LogColor.MAGENTA)
