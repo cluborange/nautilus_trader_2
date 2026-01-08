@@ -3363,8 +3363,8 @@ fn test_submit_order_for_less_than_max_cum_transaction_value_adausdt_with_crypto
 
     let quote = QuoteTick::new(
         instrument_xbtusd_bitmex.id(),
-        Price::from("0.6109"),
-        Price::from("0.6110"),
+        Price::from("50000.0"),
+        Price::from("50000.5"),
         Quantity::from("1000"),
         Quantity::from("1000"),
         UnixNanos::default(),
@@ -3750,5 +3750,229 @@ fn test_submit_order_with_quote_quantity_exceeds_max_after_conversion(
             .message()
             .unwrap()
             .contains("QUANTITY_EXCEEDS_MAXIMUM")
+    );
+}
+
+/// Tests that inverse instrument order is DENIED when account has insufficient settlement currency.
+///
+/// XBTUSD is an inverse perpetual where settlement_currency = BTC.
+/// Account has 0.1 BTC but order requires 0.2 BTC → order should be denied.
+/// This verifies the fix: balance check uses cost_currency (BTC), not quote_currency (USD).
+#[rstest]
+fn test_inverse_instrument_denies_order_when_insufficient_settlement_currency(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_xbtusd_bitmex: InstrumentAny,
+    process_order_event_handler: ShareableMessageHandler,
+    execute_order_event_handler: ShareableMessageHandler,
+    mut simple_cache: Cache,
+) {
+    assert!(
+        instrument_xbtusd_bitmex.is_inverse(),
+        "XBTUSD should be an inverse instrument"
+    );
+
+    msgbus::register(
+        MessagingSwitchboard::exec_engine_process(),
+        process_order_event_handler.clone(),
+    );
+    msgbus::register(
+        MessagingSwitchboard::exec_engine_execute(),
+        execute_order_event_handler.clone(),
+    );
+
+    // At price $50,000: 10,000 contracts requires 10000/50000 = 0.2 BTC
+    let quote = QuoteTick::new(
+        instrument_xbtusd_bitmex.id(),
+        Price::from("50000.0"),
+        Price::from("50000.5"),
+        Quantity::from("50000"),
+        Quantity::from("50000"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+
+    simple_cache
+        .add_instrument(instrument_xbtusd_bitmex.clone())
+        .unwrap();
+
+    // Account has 0.1 BTC (insufficient for 0.2 BTC required) and 100,000 USDT
+    // With buggy code: would check USDT balance (100,000) - passes incorrectly
+    // With fix: checks BTC balance (0.1) vs 0.2 required - correctly denied
+    let insufficient_btc_account = AccountState::new(
+        AccountId::from("BITMEX-001"),
+        AccountType::Cash,
+        vec![
+            AccountBalance::new(
+                Money::from("0.1 BTC"),
+                Money::from("0 BTC"),
+                Money::from("0.1 BTC"),
+            ),
+            AccountBalance::new(
+                Money::from("100000 USDT"),
+                Money::from("0 USDT"),
+                Money::from("100000 USDT"),
+            ),
+        ],
+        vec![],
+        false, // no borrowing
+        uuid4(),
+        0.into(),
+        0.into(),
+        None,
+    );
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(insufficient_btc_account)))
+        .unwrap();
+
+    simple_cache.add_quote(quote).unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+
+    // BUY 10,000 contracts at $50,000 requires 0.2 BTC, but we only have 0.1 BTC
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_xbtusd_bitmex.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from_str("10000").unwrap())
+        .build();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_xbtusd_bitmex.id(),
+        order,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock.borrow().timestamp_ns(),
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    // Order should be DENIED - insufficient BTC (0.1 available, 0.2 required)
+    let saved_process_messages =
+        get_process_order_event_handler_messages(process_order_event_handler);
+    assert_eq!(
+        saved_process_messages.len(),
+        1,
+        "Order should be denied - insufficient BTC (0.1 available, 0.2 required)"
+    );
+    assert_eq!(
+        saved_process_messages.first().unwrap().event_type(),
+        OrderEventType::Denied
+    );
+
+    // Order should NOT be sent to execution engine
+    let saved_execute_messages =
+        get_execute_order_event_handler_messages(execute_order_event_handler);
+    assert_eq!(
+        saved_execute_messages.len(),
+        0,
+        "Order should not be forwarded to execution engine"
+    );
+}
+
+/// Tests that inverse instrument order is APPROVED when account has settlement currency.
+///
+/// XBTUSD is an inverse perpetual where settlement_currency = BTC.
+/// Account has BTC → order should be approved and forwarded to execution.
+#[rstest]
+fn test_inverse_instrument_approves_order_when_has_settlement_currency(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_xbtusd_bitmex: InstrumentAny,
+    process_order_event_handler: ShareableMessageHandler,
+    execute_order_event_handler: ShareableMessageHandler,
+    bitmex_cash_account_state_multi: AccountState,
+    mut simple_cache: Cache,
+) {
+    assert!(
+        instrument_xbtusd_bitmex.is_inverse(),
+        "XBTUSD should be an inverse instrument"
+    );
+
+    msgbus::register(
+        MessagingSwitchboard::exec_engine_process(),
+        process_order_event_handler.clone(),
+    );
+    msgbus::register(
+        MessagingSwitchboard::exec_engine_execute(),
+        execute_order_event_handler.clone(),
+    );
+
+    // For inverse: cost = quantity / price = 10000 / 50000 = 0.2 BTC needed
+    let quote = QuoteTick::new(
+        instrument_xbtusd_bitmex.id(),
+        Price::from("50000.0"),
+        Price::from("50000.5"),
+        Quantity::from("50000"),
+        Quantity::from("50000"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+
+    simple_cache
+        .add_instrument(instrument_xbtusd_bitmex.clone())
+        .unwrap();
+
+    // Account has 10 BTC (settlement currency) - sufficient for order requiring 0.2 BTC
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            bitmex_cash_account_state_multi,
+        )))
+        .unwrap();
+
+    simple_cache.add_quote(quote).unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+
+    // BUY 10,000 contracts at $50,000 requires 0.2 BTC (we have 10 BTC)
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_xbtusd_bitmex.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from_str("10000").unwrap())
+        .build();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_xbtusd_bitmex.id(),
+        order,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock.borrow().timestamp_ns(),
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    // Order should NOT be denied - we have sufficient BTC
+    let saved_process_messages =
+        get_process_order_event_handler_messages(process_order_event_handler);
+    assert_eq!(
+        saved_process_messages.len(),
+        0,
+        "Order should not be denied - account has sufficient BTC"
+    );
+
+    // Order should be sent to execution engine
+    let saved_execute_messages =
+        get_execute_order_event_handler_messages(execute_order_event_handler);
+    assert_eq!(
+        saved_execute_messages.len(),
+        1,
+        "Order should be forwarded to execution engine"
+    );
+    assert_eq!(
+        saved_execute_messages.first().unwrap().instrument_id(),
+        instrument_xbtusd_bitmex.id()
     );
 }

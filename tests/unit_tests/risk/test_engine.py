@@ -3411,3 +3411,195 @@ class TestRiskEngineWithCryptoCashAccount:
         # Assert
         assert order.status == OrderStatus.INITIALIZED
         assert self.exec_engine.command_count == 1
+
+    def test_inverse_instrument_denies_order_when_insufficient_settlement_currency(self):
+        """
+        Test that inverse instruments check cost_currency (BTC) not quote_currency
+        (USD).
+
+        For inverse instruments like XBTUSD:
+        - quote_currency = USD
+        - cost_currency = settlement_currency = base_currency = BTC
+
+        """
+        # Arrange - Create a fresh setup for BITMEX with inverse instrument
+        bitmex_venue = Venue("BITMEX")
+        bitmex_account_id = AccountId("BITMEX-001")
+
+        # Re-register components for BITMEX
+        exec_client = MockExecutionClient(
+            client_id=ClientId("BITMEX"),
+            venue=bitmex_venue,
+            account_type=AccountType.CASH,
+            base_currency=None,  # Multi-currency
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_client(exec_client)
+
+        # Account with insufficient BTC (0.1 BTC) for a 10,000 contract order (~0.2 BTC)
+        # Also has USDT to verify we're NOT checking USDT balance
+        bitmex_account_state = AccountState(
+            account_id=bitmex_account_id,
+            account_type=AccountType.CASH,
+            base_currency=None,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money("0.1", BTC),  # Only 0.1 BTC available (insufficient)
+                    Money("0", BTC),
+                    Money("0.1", BTC),
+                ),
+                AccountBalance(
+                    Money(100_000, USDT),  # Plenty of USDT (should be ignored for inverse)
+                    Money(0, USDT),
+                    Money(100_000, USDT),
+                ),
+            ],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.portfolio.update_account(bitmex_account_state)
+
+        # Add inverse instrument
+        self.cache.add_instrument(_XBTUSD_BITMEX)
+
+        # Setup market price ($50,000)
+        quote = TestDataStubs.quote_tick(
+            instrument=_XBTUSD_BITMEX,
+            bid_price=50_000.00,
+            ask_price=50_000.00,
+        )
+        self.cache.add_quote_tick(quote)
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Create order for 10,000 contracts at $50,000
+        # Cost = 10,000 / 50,000 = 0.2 BTC (exceeds 0.1 BTC available)
+        order = strategy.order_factory.market(
+            _XBTUSD_BITMEX.id,
+            OrderSide.BUY,
+            Quantity.from_int(10_000),
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert - Should be DENIED due to insufficient BTC
+        # Before fix: Would pass (incorrectly checking non-existent USD balance)
+        # After fix: Denied (correctly checking 0.1 BTC < 0.2 BTC required)
+        assert order.status == OrderStatus.DENIED
+
+    def test_inverse_instrument_approves_order_when_has_settlement_currency(self):
+        """
+        Test that inverse instruments approve orders when settlement currency is
+        sufficient.
+
+        For inverse instruments like XBTUSD:
+        - quote_currency = USD
+        - cost_currency = settlement_currency = base_currency = BTC
+
+        This test verifies orders are approved when BTC balance is sufficient.
+
+        """
+        # Arrange - Create a fresh setup for BITMEX with inverse instrument
+        bitmex_venue = Venue("BITMEX")
+        bitmex_account_id = AccountId("BITMEX-002")
+
+        # Re-register components for BITMEX
+        exec_client = MockExecutionClient(
+            client_id=ClientId("BITMEX2"),
+            venue=bitmex_venue,
+            account_type=AccountType.CASH,
+            base_currency=None,  # Multi-currency
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_client(exec_client)
+
+        # Account with sufficient BTC (10 BTC)
+        bitmex_account_state = AccountState(
+            account_id=bitmex_account_id,
+            account_type=AccountType.CASH,
+            base_currency=None,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(10, BTC),  # 10 BTC available (sufficient for 0.2 BTC order)
+                    Money(0, BTC),
+                    Money(10, BTC),
+                ),
+            ],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.portfolio.update_account(bitmex_account_state)
+
+        # Add inverse instrument (may already be there from previous test)
+        if _XBTUSD_BITMEX.id not in self.cache.instrument_ids():
+            self.cache.add_instrument(_XBTUSD_BITMEX)
+
+        # Setup market price ($50,000)
+        quote = TestDataStubs.quote_tick(
+            instrument=_XBTUSD_BITMEX,
+            bid_price=50_000.00,
+            ask_price=50_000.00,
+        )
+        self.cache.add_quote_tick(quote)
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Create order for 10,000 contracts at $50,000
+        # Cost = 10,000 / 50,000 = 0.2 BTC (well within 10 BTC available)
+        order = strategy.order_factory.market(
+            _XBTUSD_BITMEX.id,
+            OrderSide.BUY,
+            Quantity.from_int(10_000),
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert - Should be APPROVED since we have 10 BTC > 0.2 BTC required
+        assert order.status == OrderStatus.INITIALIZED
+        assert self.exec_engine.command_count == 1
