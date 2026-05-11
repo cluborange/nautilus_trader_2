@@ -33,12 +33,16 @@ from py_clob_client_v2.clob_types import OrderMarketCancelParams
 from py_clob_client_v2.clob_types import OrderType as PolyOrderType
 from py_clob_client_v2.clob_types import PostOrdersV2Args
 from py_clob_client_v2.exceptions import PolyApiException
+from py_clob_client_v2.order_utils.model.order_data_v2 import SignedOrderV2
+from py_clob_client_v2.order_utils.model.side import Side
+from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2
 
 from nautilus_trader.adapters.polymarket.common.cache import get_polymarket_trades_key
 from nautilus_trader.adapters.polymarket.common.constants import DUST_POSITION_THRESHOLD
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_CANCEL_ALREADY_DONE
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_FINALIZED_TRADE_STATUSES
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_INVALID_API_KEY
+from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_MIN_MAX_PRICES
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_NAUTILUS_BUILDER_CODE
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_VENUE
 from nautilus_trader.adapters.polymarket.common.constants import VALID_POLYMARKET_TIME_IN_FORCE
@@ -116,6 +120,9 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
 
+POLYMARKET_RUST_MARKET_ORDER_EXPIRATION_SECS = 120
+
+
 class PolymarketExecutionClient(LiveExecutionClient):
     """
     Provides an execution client for Polymarket, a decentralized predication market.
@@ -138,6 +145,10 @@ class PolymarketExecutionClient(LiveExecutionClient):
         The configuration for the client.
     name : str, optional
         The custom client ID.
+    rust_client : PyClobClient, optional
+        Optional Rust CLOB client used to sign orders. Posting always uses the
+        Python ``ClobClient``. When ``None``, signing falls back to the Python
+        client.
 
     """
 
@@ -154,6 +165,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         ws_auth: PolymarketWebSocketAuth,
         config: PolymarketExecClientConfig,
         name: str | None,
+        rust_client: Any | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -178,6 +190,15 @@ class PolymarketExecutionClient(LiveExecutionClient):
         self._log.info(f"{config.generate_order_history_from_trades=}", LogColor.BLUE)
         self._log.info(f"{config.log_raw_ws_messages=}", LogColor.BLUE)
         self._log.info(f"{config.ack_timeout_secs=}", LogColor.BLUE)
+        self._log.info(f"{config.use_rust=}", LogColor.BLUE)
+
+        # Optional Rust CLOB client for order signing (posting always uses Python).
+        self._rust_client = rust_client
+        if self._rust_client is not None:
+            self._log.info(
+                "Using Rust client for order signing (Python client posts orders)",
+                LogColor.GREEN,
+            )
 
         account_id = AccountId(f"{name or POLYMARKET_VENUE.value}-001")
         self._set_account_id(account_id)
@@ -244,6 +265,8 @@ class PolymarketExecutionClient(LiveExecutionClient):
         self._finalized_trades: OrderedDict[TradeId, None] = OrderedDict()
         self._ack_events_order: dict[VenueOrderId, asyncio.Event] = {}
         self._ack_events_trade: dict[VenueOrderId, asyncio.Event] = {}
+        self._order_timing_starts: dict[VenueOrderId, float] = {}
+        self._order_ack_seen_at: dict[VenueOrderId, float] = {}
         self._collateral_balance_pusd: float | None = None
 
     def calculate_commission(self, instrument, last_qty, last_px, liquidity_side):
@@ -836,6 +859,128 @@ class PolymarketExecutionClient(LiveExecutionClient):
             return False
         return instrument.info.get("neg_risk", False)
 
+    def _create_order_options(self, instrument) -> PartialCreateOrderOptions:
+        """
+        Build CLOB signing options from cached instrument metadata.
+
+        Passing both tick_size and neg_risk avoids SDK-side market metadata
+        lookups on the order signing path.
+        """
+        return PartialCreateOrderOptions(
+            tick_size=format(instrument.price_increment.as_decimal(), "f"),
+            neg_risk=self._get_neg_risk_for_instrument(instrument),
+        )
+
+    @staticmethod
+    def _build_signed_order_v2_from_rust_json(signed_order_json: str) -> SignedOrderV2:
+        """
+        Build a ``SignedOrderV2`` from JSON returned by ``PyClobClient`` signing methods.
+
+        The Rust adapter emits a camelCase payload matching the V2 wire schema
+        (``timestamp`` / ``metadata`` / ``builder`` populated), so we just need
+        to convert ``side`` and ``signatureType`` to their typed enums for the
+        Python V2 client to recognise it as a V2 order via ``hasattr(order,
+        "timestamp")``.
+        """
+        data = json.loads(signed_order_json)
+        side = Side.BUY if str(data["side"]).upper() == "BUY" else Side.SELL
+        return SignedOrderV2(
+            salt=str(data["salt"]),
+            maker=data["maker"],
+            signer=data["signer"],
+            tokenId=data["tokenId"],
+            makerAmount=data["makerAmount"],
+            takerAmount=data["takerAmount"],
+            side=side,
+            signatureType=SignatureTypeV2(int(data["signatureType"])),
+            timestamp=str(data["timestamp"]),
+            metadata=data["metadata"],
+            builder=data["builder"],
+            expiration=str(data["expiration"]),
+            signature=data["signature"],
+        )
+
+    async def _sign_limit_order_rust(self, order: Order, instrument) -> SignedOrderV2:
+        """
+        Sign a single limit order via the Rust CLOB client.
+
+        Returns a ``SignedOrderV2`` ready to be posted by the Python client.
+        """
+        tick_size = float(instrument.price_increment.as_decimal())
+        neg_risk = self._get_neg_risk_for_instrument(instrument)
+        signed_order_json = await self._rust_client.create_order(
+            get_polymarket_token_id(order.instrument_id),
+            order_side_to_str(order.side),
+            float(order.quantity),
+            float(order.price),
+            self._get_expiration_secs(order),
+            tick_size,
+            neg_risk,
+        )
+        return self._build_signed_order_v2_from_rust_json(signed_order_json)
+
+    @staticmethod
+    def _get_min_max_prices(instrument) -> tuple[float, float]:
+        """
+        Return the (min, max) marketable limit prices for the instrument's tick size.
+        """
+        tick_size_str = format(instrument.price_increment.as_decimal(), "f")
+        return POLYMARKET_MIN_MAX_PRICES.get(
+            tick_size_str,
+            POLYMARKET_MIN_MAX_PRICES[None],
+        )
+
+    @staticmethod
+    def _get_expiration_secs(order: Order) -> int:
+        """
+        Return the Polymarket order expiration in seconds, or 0 for no expiry.
+        """
+        expire_time_ns = getattr(order, "expire_time_ns", None)
+        return int(nanos_to_secs(expire_time_ns)) if expire_time_ns else 0
+
+    def _get_rust_market_order_expiration_secs(self) -> int:
+        """
+        Return a short GTD expiration for Rust-signed market-as-limit orders.
+        """
+        return int(self._clock.timestamp()) + POLYMARKET_RUST_MARKET_ORDER_EXPIRATION_SECS
+
+    async def _sign_market_order_rust_as_limit(
+        self,
+        order: Order,
+        instrument,
+    ) -> SignedOrderV2:
+        """
+        Sign a market order as an aggressive limit via the Rust CLOB client.
+
+        We sign a regular limit at the per-tick-size boundary (max for BUY,
+        min for SELL) with a short GTD expiration. ``order.quantity`` is passed
+        straight through as base-share size for both sides so fills cannot
+        exceed the requested share quantity.
+        """
+        min_price, max_price = self._get_min_max_prices(instrument)
+        tick_size = float(instrument.price_increment.as_decimal())
+        neg_risk = self._get_neg_risk_for_instrument(instrument)
+        price = max_price if order.side == OrderSide.BUY else min_price
+        size = float(order.quantity)
+
+        self._log.info(
+            f"Signing market order as limit via Rust: "
+            f"side={order_side_to_str(order.side)} price={price} "
+            f"size={size} tick_size={tick_size}",
+            LogColor.CYAN,
+        )
+
+        signed_order_json = await self._rust_client.create_order(
+            get_polymarket_token_id(order.instrument_id),
+            order_side_to_str(order.side),
+            size,
+            price,
+            self._get_rust_market_order_expiration_secs(),
+            tick_size,
+            neg_risk,
+        )
+        return self._build_signed_order_v2_from_rust_json(signed_order_json)
+
     async def _query_account(self, _command: QueryAccount) -> None:
         # Specific account ID (sub account) not yet supported
         await self._update_account_state()
@@ -1303,6 +1448,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             await self._maintain_active_market(order.instrument_id)
 
         # Sign all orders (individual failures are rejected during signing)
+        timing_start = self._clock.timestamp()
         signed_orders, signed_orders_args = await self._sign_orders_for_batch(orders)
 
         if not signed_orders:
@@ -1324,6 +1470,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             signed_orders,
             signed_orders_args,
             post_only=post_only,
+            timing_start=timing_start,
         )
 
     async def _sign_orders_for_batch(
@@ -1333,6 +1480,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
         """
         Sign multiple orders for batch submission.
 
+        When a Rust client is configured, all orders are signed in parallel via
+        ``asyncio.gather``. Otherwise orders are signed sequentially with the
+        Python client. In both cases, individual signing failures reject only
+        that order and are excluded from the returned lists.
+
         Returns
         -------
         tuple[list[Order], list[PostOrdersV2Args]]
@@ -1340,9 +1492,36 @@ class PolymarketExecutionClient(LiveExecutionClient):
             Orders that fail to sign are rejected and excluded from the result.
 
         """
+        signing_start = self._clock.timestamp()
+
+        if self._rust_client is not None:
+            successfully_signed_orders, signed_orders_args = await self._sign_orders_for_batch_rust(
+                orders
+            )
+            signing_backend = "rust"
+        else:
+            (
+                successfully_signed_orders,
+                signed_orders_args,
+            ) = await self._sign_orders_for_batch_python(orders)
+            signing_backend = "python"
+
+        interval = self._clock.timestamp() - signing_start
+        self._log.info(
+            "POLYMARKET_ORDER_TIMING sign_order_batch "
+            f"signed_count={len(successfully_signed_orders)} "
+            f"order_count={len(orders)} signer={signing_backend} elapsed={interval:.3f}s",
+            LogColor.BLUE,
+        )
+
+        return successfully_signed_orders, signed_orders_args
+
+    async def _sign_orders_for_batch_python(
+        self,
+        orders: list[Order],
+    ) -> tuple[list[Order], list[PostOrdersV2Args]]:
         signed_orders_args: list[PostOrdersV2Args] = []
         successfully_signed_orders: list[Order] = []
-        signing_start = self._clock.timestamp()
 
         for order in orders:
             try:
@@ -1353,17 +1532,14 @@ class PolymarketExecutionClient(LiveExecutionClient):
                     token_id=get_polymarket_token_id(order.instrument_id),
                     size=float(order.quantity),
                     side=order_side_to_str(order.side),
-                    expiration=int(nanos_to_secs(order.expire_time_ns)),
+                    expiration=self._get_expiration_secs(order),
                     builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
                 )
-
-                neg_risk = self._get_neg_risk_for_instrument(instrument)
-                options = PartialCreateOrderOptions(neg_risk=neg_risk)
 
                 signed_order = await asyncio.to_thread(
                     self._http_client.create_order,
                     order_args,
-                    options=options,
+                    options=self._create_order_options(instrument),
                 )
 
                 order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
@@ -1387,12 +1563,46 @@ class PolymarketExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
 
-        interval = self._clock.timestamp() - signing_start
-        self._log.info(
-            f"Signed {len(successfully_signed_orders)}/{len(orders)} Polymarket orders "
-            f"in {interval:.3f}s",
-            LogColor.BLUE,
+        return successfully_signed_orders, signed_orders_args
+
+    async def _sign_orders_for_batch_rust(
+        self,
+        orders: list[Order],
+    ) -> tuple[list[Order], list[PostOrdersV2Args]]:
+        async def sign_one(order: Order) -> SignedOrderV2:
+            instrument = self._cache.instrument(order.instrument_id)
+            return await self._sign_limit_order_rust(order, instrument)
+
+        results = await asyncio.gather(
+            *[sign_one(order) for order in orders],
+            return_exceptions=True,
         )
+
+        signed_orders_args: list[PostOrdersV2Args] = []
+        successfully_signed_orders: list[Order] = []
+        for order, result in zip(orders, results, strict=True):
+            if isinstance(result, BaseException):
+                self._log.error(
+                    f"Failed to sign order {order.client_order_id} via Rust: {result}",
+                    LogColor.RED,
+                )
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason=f"Order signing failed: {result}",
+                    ts_event=self._clock.timestamp_ns(),
+                )
+                continue
+
+            order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
+            signed_orders_args.append(
+                PostOrdersV2Args(
+                    order=result,
+                    orderType=order_type,
+                ),
+            )
+            successfully_signed_orders.append(order)
 
         return successfully_signed_orders, signed_orders_args
 
@@ -1401,6 +1611,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         orders: list[Order],
         signed_orders_args: list[PostOrdersV2Args],
         post_only: bool = False,
+        timing_start: float | None = None,
     ) -> None:
         """
         Post a batch of signed orders to Polymarket.
@@ -1422,6 +1633,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 return
 
             self._process_batch_response(orders, response)
+            if timing_start is not None:
+                elapsed = self._clock.timestamp() - timing_start
+                self._log.info(
+                    "POLYMARKET_ORDER_TIMING sign_and_post_order_batch "
+                    f"order_count={len(orders)} elapsed={elapsed:.3f}s",
+                    LogColor.BLUE,
+                )
 
         except Exception as e:
             self._log.error(f"Error submitting order batch: {e}")
@@ -1516,69 +1734,83 @@ class PolymarketExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
-    async def _get_collateral_balance_pusd(self) -> float:
-        if self._collateral_balance_pusd is not None:
-            return self._collateral_balance_pusd
-
-        params = BalanceAllowanceParams(
-            asset_type=AssetType.COLLATERAL,
-            signature_type=self._config.signature_type,
-        )
-        response: dict[str, Any] = await asyncio.to_thread(
-            self._http_client.get_balance_allowance,
-            params,
-        )
-        self._collateral_balance_pusd = int(response["balance"]) / 1_000_000
-        return self._collateral_balance_pusd
+    def _cached_collateral_balance_pusd(self) -> float:
+        return self._collateral_balance_pusd if self._collateral_balance_pusd is not None else 0.0
 
     async def _submit_market_order(self, command: SubmitOrder, instrument) -> None:
         self._log.debug("Creating Polymarket order", LogColor.MAGENTA)
 
         order = command.order
 
-        if order.side == OrderSide.BUY:
-            if not order.is_quote_quantity:
-                self._deny_market_order_quantity(
-                    order,
-                    "Polymarket market BUY orders require quote-denominated quantities; "
-                    "resubmit with `quote_quantity=True`",
-                )
-                return
-        else:
-            if order.is_quote_quantity:
-                self._deny_market_order_quantity(
-                    order,
-                    "Polymarket market SELL orders require base-denominated quantities; "
-                    "resubmit with `quote_quantity=False`",
-                )
-                return
+        # The Rust path signs as a base-share marketable limit, so the V2 quote
+        # vs base requirements only apply to the Python ``create_market_order``
+        # branch.
+        if self._rust_client is None:
+            if order.side == OrderSide.BUY:
+                if not order.is_quote_quantity:
+                    self._deny_market_order_quantity(
+                        order,
+                        "Polymarket market BUY orders require quote-denominated quantities; "
+                        "resubmit with `quote_quantity=True`",
+                    )
+                    return
+            else:
+                if order.is_quote_quantity:
+                    self._deny_market_order_quantity(
+                        order,
+                        "Polymarket market SELL orders require base-denominated quantities; "
+                        "resubmit with `quote_quantity=False`",
+                    )
+                    return
+        elif order.is_quote_quantity:
+            self._deny_market_order_quantity(
+                order,
+                "Polymarket Rust-signed market orders require base-denominated "
+                "quantities; resubmit with `quote_quantity=False`",
+            )
+            return
 
-        amount = float(order.quantity)
-        user_usdc_balance = (
-            await self._get_collateral_balance_pusd()
-            if order.side == OrderSide.BUY and order.is_quote_quantity
-            else 0.0
-        )
-
-        market_order_args = MarketOrderArgsV2(
-            token_id=get_polymarket_token_id(order.instrument_id),
-            amount=amount,
-            side=order_side_to_str(order.side),
-            order_type=PolyOrderType.FOK,
-            user_usdc_balance=user_usdc_balance,
-            builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
-        )
-
-        neg_risk = self._get_neg_risk_for_instrument(instrument)
-        options = PartialCreateOrderOptions(neg_risk=neg_risk)
         signing_start = self._clock.timestamp()
-        signed_order = await asyncio.to_thread(
-            self._http_client.create_market_order,
-            market_order_args,
-            options=options,
-        )
+        if self._rust_client is not None:
+            signed_order = await self._sign_market_order_rust_as_limit(
+                order,
+                instrument,
+            )
+            base_quantity = None
+            signing_backend = "rust"
+        else:
+            amount = float(order.quantity)
+            user_usdc_balance = (
+                self._cached_collateral_balance_pusd()
+                if order.side == OrderSide.BUY and order.is_quote_quantity
+                else 0.0
+            )
+            market_order_args = MarketOrderArgsV2(
+                token_id=get_polymarket_token_id(order.instrument_id),
+                amount=amount,
+                side=order_side_to_str(order.side),
+                order_type=PolyOrderType.FOK,
+                user_usdc_balance=user_usdc_balance,
+                builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
+            )
+            signed_order = await asyncio.to_thread(
+                self._http_client.create_market_order,
+                market_order_args,
+                options=self._create_order_options(instrument),
+            )
+            base_quantity = None
+            if order.is_quote_quantity and order.side == OrderSide.BUY:
+                # SignedOrderV2 is a flat dataclass; takerAmount is the share base unit count.
+                taker_amount = int(signed_order.takerAmount)
+                base_qty_value = taker_amount / 1e6
+                base_quantity = Quantity(base_qty_value, instrument.size_precision)
+            signing_backend = "python"
         interval = self._clock.timestamp() - signing_start
-        self._log.info(f"Signed Polymarket market order in {interval:.3f}s", LogColor.BLUE)
+        self._log.info(
+            f"POLYMARKET_ORDER_TIMING sign_order client_order_id={order.client_order_id} "
+            f"order_type=market signer={signing_backend} elapsed={interval:.3f}s",
+            LogColor.BLUE,
+        )
 
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
@@ -1587,20 +1819,14 @@ class PolymarketExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
-        # Compute base quantity from the signed order for BUY quote-quantity orders
-        base_quantity = None
-
-        if order.is_quote_quantity and order.side == OrderSide.BUY:
-            # SignedOrderV2 is a flat dataclass; takerAmount is the share base unit count.
-            taker_amount = int(signed_order.takerAmount)
-            base_qty_value = taker_amount / 1e6
-            base_quantity = Quantity(base_qty_value, instrument.size_precision)
-
         await self._post_signed_order(
             order,
             signed_order,
-            order_type_override=PolyOrderType.FOK,
+            order_type_override=PolyOrderType.GTD
+            if self._rust_client is not None
+            else PolyOrderType.FOK,
             base_quantity=base_quantity,
+            timing_start=signing_start,
         )
 
     async def _submit_limit_order(self, command: SubmitOrder, instrument) -> None:
@@ -1622,26 +1848,31 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             return
 
-        # Create signed Polymarket limit order
-        order_args = OrderArgsV2(
-            price=float(order.price),
-            token_id=get_polymarket_token_id(order.instrument_id),
-            size=float(order.quantity),
-            side=order_side_to_str(order.side),
-            expiration=int(nanos_to_secs(order.expire_time_ns)),
-            builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
-        )
-
-        neg_risk = self._get_neg_risk_for_instrument(instrument)
-        options = PartialCreateOrderOptions(neg_risk=neg_risk)
         signing_start = self._clock.timestamp()
-        signed_order = await asyncio.to_thread(
-            self._http_client.create_order,
-            order_args,
-            options=options,
-        )
+        if self._rust_client is not None:
+            signed_order = await self._sign_limit_order_rust(order, instrument)
+            signing_backend = "rust"
+        else:
+            order_args = OrderArgsV2(
+                price=float(order.price),
+                token_id=get_polymarket_token_id(order.instrument_id),
+                size=float(order.quantity),
+                side=order_side_to_str(order.side),
+                expiration=self._get_expiration_secs(order),
+                builder_code=POLYMARKET_NAUTILUS_BUILDER_CODE,
+            )
+            signed_order = await asyncio.to_thread(
+                self._http_client.create_order,
+                order_args,
+                options=self._create_order_options(instrument),
+            )
+            signing_backend = "python"
         interval = self._clock.timestamp() - signing_start
-        self._log.info(f"Signed Polymarket order in {interval:.3f}s", LogColor.BLUE)
+        self._log.info(
+            f"POLYMARKET_ORDER_TIMING sign_order client_order_id={order.client_order_id} "
+            f"order_type=limit signer={signing_backend} elapsed={interval:.3f}s",
+            LogColor.BLUE,
+        )
 
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
@@ -1650,7 +1881,12 @@ class PolymarketExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
-        await self._post_signed_order(order, signed_order, post_only=order.is_post_only)
+        await self._post_signed_order(
+            order,
+            signed_order,
+            post_only=order.is_post_only,
+            timing_start=signing_start,
+        )
 
     async def _post_signed_order(
         self,
@@ -1659,6 +1895,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         post_only: bool = False,
         order_type_override=None,
         base_quantity: Quantity | None = None,
+        timing_start: float | None = None,
     ) -> None:
         retry_manager = await self._retry_manager_pool.acquire()
         try:
@@ -1686,6 +1923,31 @@ class PolymarketExecutionClient(LiveExecutionClient):
             else:
                 venue_order_id = VenueOrderId(response["orderID"])
                 self._cache.add_venue_order_id(order.client_order_id, venue_order_id)
+
+                if timing_start is not None:
+                    elapsed = self._clock.timestamp() - timing_start
+                    self._order_timing_starts[venue_order_id] = timing_start
+                    self._log.info(
+                        "POLYMARKET_ORDER_TIMING sign_and_post_order "
+                        f"client_order_id={order.client_order_id} "
+                        f"venue_order_id={venue_order_id} elapsed={elapsed:.3f}s",
+                        LogColor.BLUE,
+                    )
+                    ack_seen_at = self._order_ack_seen_at.pop(venue_order_id, None)
+                    if ack_seen_at is not None:
+                        self._log_order_ack_timing(
+                            venue_order_id=venue_order_id,
+                            client_order_id=order.client_order_id,
+                            ack_seen_at=ack_seen_at,
+                            store_if_missing=False,
+                        )
+                    if venue_order_id in self._order_timing_starts:
+                        self.create_task(
+                            self._expire_order_ack_timing(
+                                venue_order_id=venue_order_id,
+                                client_order_id=order.client_order_id,
+                            ),
+                        )
 
                 # Emit quote-to-base conversion after successful submission
                 if base_quantity is not None:
@@ -1745,6 +2007,46 @@ class PolymarketExecutionClient(LiveExecutionClient):
         finally:
             await self._retry_manager_pool.release(retry_manager)
 
+    def _log_order_ack_timing(
+        self,
+        venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId | None,
+        ack_seen_at: float,
+        store_if_missing: bool,
+    ) -> None:
+        timing_start = self._order_timing_starts.pop(venue_order_id, None)
+        if timing_start is None:
+            if store_if_missing:
+                self._order_ack_seen_at[venue_order_id] = ack_seen_at
+            return
+
+        elapsed = ack_seen_at - timing_start
+        self._log.info(
+            "POLYMARKET_ORDER_TIMING order_ack "
+            f"client_order_id={client_order_id} "
+            f"venue_order_id={venue_order_id} elapsed={elapsed:.3f}s",
+            LogColor.BLUE,
+        )
+
+    async def _expire_order_ack_timing(
+        self,
+        venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId,
+    ) -> None:
+        await asyncio.sleep(self._config.ack_timeout_secs)
+
+        timing_start = self._order_timing_starts.pop(venue_order_id, None)
+        self._order_ack_seen_at.pop(venue_order_id, None)
+        if timing_start is None:
+            return
+
+        elapsed = self._clock.timestamp() - timing_start
+        self._log.warning(
+            "POLYMARKET_ORDER_TIMING order_ack_missing "
+            f"client_order_id={client_order_id} "
+            f"venue_order_id={venue_order_id} elapsed={elapsed:.3f}s",
+        )
+
     def _handle_ws_message(self, raw: bytes) -> None:
         try:
             if self._config.log_raw_ws_messages:
@@ -1783,16 +2085,23 @@ class PolymarketExecutionClient(LiveExecutionClient):
         msg: PolymarketUserOrder,
         venue_order_id: VenueOrderId,
     ) -> None:
+        ack_seen_at = self._clock.timestamp()
         client_order_id = self._cache.client_order_id(venue_order_id)
+        event = self._ack_events_order.get(venue_order_id)
+        if client_order_id is None and event is None:
+            event = asyncio.Event()
+            self._ack_events_order[venue_order_id] = event
+
+        if msg.type == PolymarketEventType.PLACEMENT:
+            self._log_order_ack_timing(
+                venue_order_id=venue_order_id,
+                client_order_id=client_order_id,
+                ack_seen_at=ack_seen_at,
+                store_if_missing=client_order_id is None,
+            )
         if client_order_id is not None:
             self._handle_ws_order_msg(msg, wait_for_ack=False)
             return
-
-        # Reuse existing event if present to avoid overwriting a pending waiter
-        event = self._ack_events_order.get(venue_order_id)
-        if event is None:
-            event = asyncio.Event()
-            self._ack_events_order[venue_order_id] = event
 
         try:
             await asyncio.wait_for(event.wait(), timeout=self._config.ack_timeout_secs)
