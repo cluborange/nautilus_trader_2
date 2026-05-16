@@ -1771,6 +1771,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             return
 
         signing_start = self._clock.timestamp()
+        self._log_order_init_to_sign_start(order, "market", signing_start)
         if self._rust_client is not None:
             signed_order = await self._sign_market_order_rust_as_limit(
                 order,
@@ -1849,6 +1850,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             return
 
         signing_start = self._clock.timestamp()
+        self._log_order_init_to_sign_start(order, "limit", signing_start)
         if self._rust_client is not None:
             signed_order = await self._sign_limit_order_rust(order, instrument)
             signing_backend = "rust"
@@ -1886,6 +1888,26 @@ class PolymarketExecutionClient(LiveExecutionClient):
             signed_order,
             post_only=order.is_post_only,
             timing_start=signing_start,
+        )
+
+    def _log_order_init_to_sign_start(
+        self,
+        order: Order,
+        order_type: str,
+        signing_start: float,
+    ) -> None:
+        ts_init = getattr(order, "ts_init", None)
+        if not ts_init:
+            return
+
+        elapsed = signing_start - (ts_init / 1_000_000_000)
+        if elapsed < 0:
+            return
+
+        self._log.info(
+            "POLYMARKET_ORDER_TIMING init_to_sign_start "
+            f"client_order_id={order.client_order_id} order_type={order_type} elapsed={elapsed:.3f}s",
+            LogColor.BLUE,
         )
 
     async def _post_signed_order(
