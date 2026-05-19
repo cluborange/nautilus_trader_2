@@ -642,7 +642,7 @@ class PolymarketDataClient(LiveMarketDataClient):
             )
 
             if quote is None:
-                self._log.warning(
+                self._log.debug(
                     f"Dropping QuoteTick for {instrument.id}: missing bid or ask prices in snapshot",
                 )
                 return
@@ -742,7 +742,7 @@ class PolymarketDataClient(LiveMarketDataClient):
             # Handle missing bid/ask prices (can occur near market resolution)
             if bid_price is None or ask_price is None:
                 if self._config.drop_quotes_missing_side:
-                    self._log.warning(
+                    self._log.debug(
                         f"Dropping QuoteTick for {instrument.id}: "
                         f"bid_price={bid_price}, ask_price={ask_price}",
                     )
