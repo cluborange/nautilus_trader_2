@@ -2001,7 +2001,7 @@ class TestPolymarketExecutionClient:
         assert call_options.tick_size == format(
             ELECTION_INSTRUMENT.price_increment.as_decimal(), "f"
         )
-        assert call_options.neg_risk == ELECTION_INSTRUMENT.info.get("neg_risk", False)
+        assert call_options.neg_risk == (ELECTION_INSTRUMENT.info or {}).get("neg_risk", False)
 
         # Check that venue order ID was cached
         venue_order_id = VenueOrderId("test_market_order_id")
@@ -2303,7 +2303,7 @@ class TestPolymarketExecutionClient:
         assert call_options.tick_size == format(
             ELECTION_INSTRUMENT.price_increment.as_decimal(), "f"
         )
-        assert call_options.neg_risk == ELECTION_INSTRUMENT.info.get("neg_risk", False)
+        assert call_options.neg_risk == (ELECTION_INSTRUMENT.info or {}).get("neg_risk", False)
 
     @pytest.mark.asyncio
     async def test_submit_order_invalid_time_in_force(self):
@@ -3732,7 +3732,7 @@ class TestPolymarketBatchOrderSubmission:
                 ELECTION_INSTRUMENT.price_increment.as_decimal(),
                 "f",
             )
-            assert options.neg_risk == ELECTION_INSTRUMENT.info.get("neg_risk", False)
+            assert options.neg_risk == (ELECTION_INSTRUMENT.info or {}).get("neg_risk", False)
 
         # Check that venue order IDs were cached
         venue_order_id_1 = VenueOrderId("batch_order_1")

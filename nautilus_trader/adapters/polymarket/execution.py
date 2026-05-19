@@ -1696,7 +1696,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 signed_order = await asyncio.to_thread(
                     self._http_client.create_order,
                     order_args,
-                    options=PartialCreateOrderOptions(neg_risk=neg_risk),
+                    options=self._create_order_options(instrument),
                 )
 
                 order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
@@ -2059,6 +2059,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             return
 
+        neg_risk = self._get_neg_risk_for_instrument(instrument)
         signing_start = self._clock.timestamp()
         self._log_order_init_to_sign_start(order, "limit", signing_start)
         if self._rust_client is not None:
