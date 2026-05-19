@@ -309,6 +309,17 @@ class PolymarketExecutionClient(LiveExecutionClient):
 
     async def _maintain_active_market(self, instrument_id: InstrumentId) -> None:
         condition_id = get_polymarket_condition_id(instrument_id)
+        # [fern2 local patch] Hot-path gate. This runs at the top of every
+        # order submit/cancel. When the condition_id already has a live
+        # subscription, skip the async, asyncio.Lock-taking, refcount-
+        # incrementing subscribe() path entirely: it would only take the
+        # lock, bump the (never-decremented) refcount and return. Avoiding
+        # the event-loop hop + lock contention here is critical for fast
+        # arb-completion market orders. Fall through to subscribe() (which
+        # owns the reconnect/retry path) when the subscription is missing
+        # or its client connection is not active.
+        if self._ws_client.is_subscription_active(condition_id):
+            return
         await self._ws_client.subscribe(condition_id)
 
     async def _update_account_state(self) -> None:

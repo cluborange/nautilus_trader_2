@@ -173,6 +173,33 @@ class PolymarketWebSocketClient:
         """
         return not self.is_connected()
 
+    def is_subscription_active(self, subscription: str) -> bool:
+        """
+        Return whether the subscription exists and its client connection is active.
+
+        [fern2 local patch] Cheap, lock-free check for hot paths (order
+        submit/cancel) that only need to confirm an existing live
+        subscription, so they can skip the async refcounting ``subscribe``
+        path. Mirrors the active-client check used inside ``subscribe`` and
+        ``is_connected``.
+
+        Parameters
+        ----------
+        subscription : str
+            The subscription identifier (condition_id for USER, token_id for MARKET).
+
+        Returns
+        -------
+        bool
+
+        """
+        client_id = self._get_client_for_subscription(subscription)
+        if client_id == -1:
+            return False
+
+        client = self._clients.get(client_id)
+        return client is not None and client.is_active()
+
     def _get_client_for_subscription(self, subscription: str) -> int:
         for client_id, subscriptions in self._client_subscriptions.items():
             if subscription in subscriptions:
