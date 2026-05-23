@@ -202,6 +202,7 @@ class _PresignedArbPlan:
     plan_key: str
     live: _LivePresignedArbBatch | None = None
     refresh_in_progress: bool = False
+    last_sign_failed: bool = False
     generation: int = 0
     last_used: float = 0.0
     posting_count: int = 0
@@ -1979,6 +1980,16 @@ class PolymarketExecutionClient(LiveExecutionClient):
         stale_after_seconds = float(request.get("stale_after_seconds", 285))
         size_tolerance = float(request.get("size_tolerance", 1.0))
         cache_max_plans = int(request.get("cache_max_plans", 256))
+        if not (refresh_after_seconds < stale_after_seconds < effective_ttl_seconds):
+            self._log.warning(
+                f"POLYMARKET_PRESIGN2 miss plan_key={plan_key} "
+                f"reason=invalid_ttl_config submit_path=prepare "
+                f"refresh_after_seconds={refresh_after_seconds:.3f} "
+                f"stale_after_seconds={stale_after_seconds:.3f} "
+                f"effective_ttl_seconds={effective_ttl_seconds:.3f}",
+                LogColor.YELLOW,
+            )
+            return
 
         plan = self._presigned_arb_plans.get(plan_key)
         if plan is None:
@@ -2029,6 +2040,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             plan.live = live_generation
             plan.generation = generation
+            plan.last_sign_failed = False
             plan.last_used = signed_at
             self._presigned_arb_plans.move_to_end(plan_key)
             elapsed_ms = (self._clock.timestamp() - start) * 1000
@@ -2049,6 +2061,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 f"result=failure reason={type(e).__name__}",
                 LogColor.YELLOW,
             )
+            plan.last_sign_failed = True
         finally:
             plan.refresh_in_progress = False
             self._evict_presign_cache_if_needed(cache_max_plans)
@@ -2195,8 +2208,8 @@ class PolymarketExecutionClient(LiveExecutionClient):
         )
         await self._process_presigned_arb_batch(batch)
 
+    @staticmethod
     def _presigned_orders_match_live(
-        self,
         orders: list[Order],
         live: _LivePresignedArbBatch,
     ) -> tuple[bool, str]:
@@ -2238,7 +2251,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
         if plan is None:
             reason = "no_cache"
         elif live is None:
-            reason = "sign_in_progress" if plan.refresh_in_progress else "no_cache"
+            reason = (
+                "sign_in_progress"
+                if plan.refresh_in_progress
+                else "last_sign_failed"
+                if plan.last_sign_failed
+                else "no_cache"
+            )
         elif self._clock.timestamp() - live.signed_at > live.stale_after_seconds:
             reason = "stale"
         else:
@@ -2327,6 +2346,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
                         )
                     ],
                 )
+        except Exception as e:
+            self._log.warning(
+                f"POLYMARKET_PRESIGN2 post_failure plan_key={batch.plan_key} "
+                f"reason={type(e).__name__} submit_path=presigned_{batch.mode}",
+                LogColor.YELLOW,
+            )
+            raise
         finally:
             plan.posting_count -= 1
 
