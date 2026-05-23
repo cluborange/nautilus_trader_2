@@ -15,8 +15,11 @@
 
 import asyncio
 import json
+import re
 from collections import OrderedDict
 from collections import defaultdict
+from dataclasses import dataclass
+from dataclasses import field
 from decimal import Decimal
 from typing import Any
 
@@ -133,6 +136,51 @@ from nautilus_trader.model.orders import Order
 
 
 POLYMARKET_RUST_MARKET_ORDER_EXPIRATION_SECS = 120
+
+# [fern2 local patch] Arb-completion batch (PR 2 — tag-coalescing path).
+#
+# Strategy tags every leg of an arb-completion burst with
+# ``arb_batch:<burst_id>:<n_legs>`` and submits each via the normal
+# ``submit_order`` API. The exec adapter buffers tagged orders by burst_id
+# and, once the buffer reaches ``n_legs`` (or a short watchdog fires),
+# signs them all in parallel via the Rust signer and posts them as a
+# single ``post_orders`` HTTP request — bypassing Nautilus's
+# ``OrderList``/``submit_order_list`` validator (which still enforces
+# same-instrument_id across the list, no good for cross-market neg-risk
+# bursts).
+ARB_BATCH_TAG_RE = re.compile(r"^arb_batch:(?P<burst_id>[a-f0-9]+):(?P<n_legs>\d+)$")
+ARB_BATCH_DEFAULT_WATCHDOG_MS = 25
+# Polymarket ``post_orders`` accepts at most 15 orders per request.
+ARB_BATCH_MAX_ORDERS_PER_POST = 15
+
+
+@dataclass
+class _PendingArbBatch:
+    """Adapter-side coalescing buffer for one in-flight arb-completion batch."""
+
+    burst_id: str
+    n_legs_expected: int
+    pending: list[tuple[SubmitOrder, Order, float]] = field(default_factory=list)
+    created_ts: float = 0.0
+    watchdog_task: "asyncio.Task | None" = None
+    flushed: bool = False
+
+
+def _parse_arb_batch_tag(tags) -> "tuple[str, int] | None":
+    """Return ``(burst_id, n_legs)`` if any tag matches the arb-batch scheme.
+
+    Tags are arbitrary order metadata; we only recognise strings of the form
+    ``arb_batch:<8hex>:<n_legs>``. Returns None when no such tag is present
+    so non-batch orders flow through the standard per-leg path.
+    """
+    if not tags:
+        return None
+    for tag in tags:
+        if isinstance(tag, str):
+            match = ARB_BATCH_TAG_RE.match(tag)
+            if match is not None:
+                return match.group("burst_id"), int(match.group("n_legs"))
+    return None
 
 
 class PolymarketExecutionClient(LiveExecutionClient):
@@ -280,6 +328,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
         self._order_timing_starts: dict[VenueOrderId, float] = {}
         self._order_ack_seen_at: dict[VenueOrderId, float] = {}
         self._collateral_balance_pusd: float | None = None
+        # [fern2 local patch] Arb-completion batch coalescing buffer keyed by
+        # burst_id (the ``arb_batch:<burst_id>:<n>`` tag on each leg). See
+        # ``_queue_arb_batch_order`` / ``_process_arb_batch``.
+        self._arb_batch_buffer: dict[str, _PendingArbBatch] = {}
+        self._arb_batch_watchdog_ms: int = ARB_BATCH_DEFAULT_WATCHDOG_MS
 
     def calculate_commission(self, instrument, last_qty, last_px, liquidity_side):
         commission = calculate_commission(
@@ -1443,6 +1496,17 @@ class PolymarketExecutionClient(LiveExecutionClient):
             self._log.warning(f"Order {order} is already closed")
             return
 
+        # [fern2 local patch] Arb-batch coalescing entrypoint. When the order
+        # carries an ``arb_batch:<burst_id>:<n_legs>`` tag we buffer it by
+        # burst_id and submit all N legs together once the buffer is full
+        # (or a short watchdog fires). Bypasses the per-leg sign+HTTP path
+        # entirely — the dominant arb-completion latency win in PR 2.
+        arb_batch_info = _parse_arb_batch_tag(order.tags)
+        if arb_batch_info is not None:
+            burst_id, n_legs = arb_batch_info
+            await self._queue_arb_batch_order(command, order, burst_id, n_legs)
+            return
+
         if order.is_reduce_only:
             self._log.error(
                 f"Cannot submit order {order.client_order_id}: "
@@ -1510,6 +1574,221 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 reason="UNSUPPORTED_ORDER_TYPE",
                 ts_event=self._clock.timestamp_ns(),
             )
+
+    # ------------------------------------------------------------------ #
+    # [fern2 local patch] Arb-completion tag-coalescing batch path.      #
+    # ------------------------------------------------------------------ #
+
+    def _validate_arb_batch_order(self, order: Order) -> str | None:
+        """Validate an arb-batch leg. Accepts both MARKET and LIMIT (single-
+        instrument constraint that Nautilus's ``OrderList`` enforces is
+        deliberately skipped — neg-risk arbs are cross-market by design)."""
+        if order.is_reduce_only:
+            return "REDUCE_ONLY_NOT_SUPPORTED"
+        if order.is_post_only and order.time_in_force not in (TimeInForce.GTC, TimeInForce.GTD):
+            return "POST_ONLY_REQUIRES_GTC_OR_GTD"
+        if order.time_in_force not in VALID_POLYMARKET_TIME_IN_FORCE:
+            return "UNSUPPORTED_TIME_IN_FORCE"
+        if order.is_quote_quantity:
+            # MARKET legs are signed as marketable limits via Rust, which
+            # requires base-share quantities (matches ``_submit_market_order``).
+            return "ARB_BATCH_REQUIRES_BASE_QUANTITIES"
+        if self._rust_client is None:
+            return "ARB_BATCH_REQUIRES_RUST_SIGNER"
+        return None
+
+    async def _queue_arb_batch_order(
+        self,
+        command: SubmitOrder,
+        order: Order,
+        burst_id: str,
+        n_legs_expected: int,
+    ) -> None:
+        """Buffer one tagged leg; fire the batch when N have arrived."""
+        denial_reason = self._validate_arb_batch_order(order)
+        if denial_reason is not None:
+            self._log.error(
+                f"Cannot arb-batch order {order.client_order_id}: {denial_reason}",
+                LogColor.RED,
+            )
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=denial_reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        now_ts = self._clock.timestamp()
+        batch = self._arb_batch_buffer.get(burst_id)
+        if batch is None:
+            batch = _PendingArbBatch(
+                burst_id=burst_id,
+                n_legs_expected=n_legs_expected,
+                created_ts=now_ts,
+            )
+            self._arb_batch_buffer[burst_id] = batch
+        batch.pending.append((command, order, now_ts))
+
+        if len(batch.pending) >= batch.n_legs_expected:
+            if batch.watchdog_task is not None and not batch.watchdog_task.done():
+                batch.watchdog_task.cancel()
+            if batch.flushed:
+                return
+            batch.flushed = True
+            self._arb_batch_buffer.pop(burst_id, None)
+            self.create_task(self._process_arb_batch(batch))
+        elif batch.watchdog_task is None:
+            batch.watchdog_task = self.create_task(self._arb_batch_watchdog(burst_id))
+
+    async def _arb_batch_watchdog(self, burst_id: str) -> None:
+        await asyncio.sleep(self._arb_batch_watchdog_ms / 1000.0)
+        batch = self._arb_batch_buffer.pop(burst_id, None)
+        if batch is None or batch.flushed:
+            return
+        batch.flushed = True
+        self._log.warning(
+            f"Arb-batch watchdog flushing burst_id={burst_id} with "
+            f"{len(batch.pending)}/{batch.n_legs_expected} legs after "
+            f"{self._arb_batch_watchdog_ms}ms — submitting partial batch.",
+            LogColor.YELLOW,
+        )
+        await self._process_arb_batch(batch)
+
+    async def _process_arb_batch(self, batch: _PendingArbBatch) -> None:
+        """Sign all buffered legs in parallel; post in ≤15-order chunks."""
+        if not batch.pending:
+            return
+
+        leg_orders: list[Order] = [order for _, order, _ in batch.pending]
+        n = len(leg_orders)
+
+        signing_start = self._clock.timestamp()
+        for _command, order, _enq_ts in batch.pending:
+            self._log_order_init_to_sign_start(order, "arb_batch", signing_start)
+
+        signed_orders, signed_orders_args, expected_venue_order_ids = (
+            await self._sign_orders_for_arb_batch_rust(leg_orders)
+        )
+        sign_elapsed = self._clock.timestamp() - signing_start
+
+        for order in signed_orders:
+            order_type_str = "market" if order.order_type == OrderType.MARKET else "limit"
+            self._log.info(
+                f"POLYMARKET_ORDER_TIMING sign_order client_order_id={order.client_order_id} "
+                f"order_type={order_type_str} signer=rust elapsed={sign_elapsed:.3f}s "
+                f"burst_id={batch.burst_id}",
+                LogColor.BLUE,
+            )
+        self._log.info(
+            f"POLYMARKET_ORDER_TIMING sign_order_batch burst_id={batch.burst_id} "
+            f"signed_count={len(signed_orders)} order_count={n} signer=rust "
+            f"elapsed={sign_elapsed:.3f}s",
+            LogColor.BLUE,
+        )
+
+        if not signed_orders:
+            self._log.warning(
+                f"Arb-batch burst_id={batch.burst_id}: no orders signed; nothing to post",
+            )
+            return
+
+        now_ns = self._clock.timestamp_ns()
+        for order in signed_orders:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=now_ns,
+            )
+
+        chunks: list[tuple[list[Order], list[PostOrdersV2Args], list[VenueOrderId | None]]] = []
+        for start in range(0, len(signed_orders), ARB_BATCH_MAX_ORDERS_PER_POST):
+            end = start + ARB_BATCH_MAX_ORDERS_PER_POST
+            chunks.append(
+                (
+                    signed_orders[start:end],
+                    signed_orders_args[start:end],
+                    expected_venue_order_ids[start:end],
+                ),
+            )
+
+        await asyncio.gather(
+            *[
+                self._post_signed_orders_batch(
+                    chunk_orders,
+                    chunk_args,
+                    chunk_expected,
+                    post_only=False,
+                    timing_start=signing_start,
+                )
+                for chunk_orders, chunk_args, chunk_expected in chunks
+            ],
+        )
+
+        post_elapsed = self._clock.timestamp() - signing_start
+        for order in signed_orders:
+            venue_order_id = self._cache.venue_order_id(order.client_order_id)
+            venue_oid_str = venue_order_id.value if venue_order_id is not None else "unknown"
+            self._log.info(
+                f"POLYMARKET_ORDER_TIMING sign_and_post_order client_order_id={order.client_order_id} "
+                f"venue_order_id={venue_oid_str} elapsed={post_elapsed:.3f}s "
+                f"burst_id={batch.burst_id}",
+                LogColor.BLUE,
+            )
+
+    async def _sign_orders_for_arb_batch_rust(
+        self,
+        orders: list[Order],
+    ) -> tuple[list[Order], list[PostOrdersV2Args], list[VenueOrderId | None]]:
+        """Mirror of ``_sign_orders_for_batch_rust`` that dispatches MARKET
+        legs to ``_sign_market_order_rust_as_limit`` (the same recipe the
+        single-order MARKET path uses)."""
+        async def sign_one(order: Order) -> SignedOrderV2:
+            instrument = self._cache.instrument(order.instrument_id)
+            if order.order_type == OrderType.MARKET:
+                return await self._sign_market_order_rust_as_limit(order, instrument)
+            return await self._sign_limit_order_rust(order, instrument)
+
+        results = await asyncio.gather(
+            *[sign_one(order) for order in orders],
+            return_exceptions=True,
+        )
+
+        signed_orders_args: list[PostOrdersV2Args] = []
+        successfully_signed_orders: list[Order] = []
+        expected_venue_order_ids: list[VenueOrderId | None] = []
+        for order, result in zip(orders, results, strict=True):
+            if isinstance(result, BaseException):
+                self._log.error(
+                    f"Failed to sign arb-batch leg {order.client_order_id} via Rust: {result}",
+                    LogColor.RED,
+                )
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason=f"Order signing failed: {result}",
+                    ts_event=self._clock.timestamp_ns(),
+                )
+                continue
+            if order.order_type == OrderType.MARKET:
+                poly_order_type = PolyOrderType.GTD
+            else:
+                poly_order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
+            signed_orders_args.append(
+                PostOrdersV2Args(order=result, orderType=poly_order_type),
+            )
+            successfully_signed_orders.append(order)
+            instrument = self._cache.instrument(order.instrument_id)
+            expected_venue_order_ids.append(
+                self._expected_venue_order_id(
+                    result,
+                    neg_risk=self._get_neg_risk_for_instrument(instrument),
+                ),
+            )
+        return successfully_signed_orders, signed_orders_args, expected_venue_order_ids
 
     def _validate_order_for_batch(self, order: Order) -> str | None:
         """
