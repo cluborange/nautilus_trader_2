@@ -135,7 +135,12 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
 
-POLYMARKET_RUST_MARKET_ORDER_EXPIRATION_SECS = 120
+# Polymarket GTD orders need roughly 60s of security buffer. A 360s raw
+# expiration gives Rust-signed marketable limits about 5 minutes of effective
+# usable life.
+POLYMARKET_RUST_MARKET_ORDER_EXPIRATION_SECS = 360
+POLYMARKET_PRESIGN_ENDPOINT = "PolymarketExecutionClient.presign_arb"
+POLYMARKET_GTD_SECURITY_BUFFER_SECS = 60
 
 # [fern2 local patch] Arb-completion batch (PR 2 — tag-coalescing path).
 #
@@ -149,6 +154,9 @@ POLYMARKET_RUST_MARKET_ORDER_EXPIRATION_SECS = 120
 # same-instrument_id across the list, no good for cross-market neg-risk
 # bursts).
 ARB_BATCH_TAG_RE = re.compile(r"^arb_batch:(?P<burst_id>[a-f0-9]+):(?P<n_legs>\d+)$")
+PRESIGNED_ARB_TAG_RE = re.compile(
+    r"^arb_presigned_(?P<mode>batch|individual):(?P<plan_key>[a-f0-9]+):(?P<n_legs>\d+)$",
+)
 ARB_BATCH_DEFAULT_WATCHDOG_MS = 25
 # Polymarket ``post_orders`` accepts at most 15 orders per request.
 ARB_BATCH_MAX_ORDERS_PER_POST = 15
@@ -159,6 +167,50 @@ class _PendingArbBatch:
     """Adapter-side coalescing buffer for one in-flight arb-completion batch."""
 
     burst_id: str
+    n_legs_expected: int
+    pending: list[tuple[SubmitOrder, Order, float]] = field(default_factory=list)
+    created_ts: float = 0.0
+    watchdog_task: "asyncio.Task | None" = None
+    flushed: bool = False
+
+
+@dataclass
+class _PresignedArbLegSpec:
+    instrument_id: InstrumentId
+    side: str
+    size: float
+    tick_size: str
+    neg_risk: bool
+    boundary_price: float
+
+
+@dataclass
+class _LivePresignedArbBatch:
+    plan_key: str
+    leg_specs: list[_PresignedArbLegSpec]
+    signed_orders_args: list[PostOrdersV2Args]
+    expected_venue_order_ids: list[VenueOrderId | None]
+    signed_at: float
+    effective_expires_at: float
+    stale_after_seconds: float
+    size_tolerance: float
+    generation: int
+
+
+@dataclass
+class _PresignedArbPlan:
+    plan_key: str
+    live: _LivePresignedArbBatch | None = None
+    refresh_in_progress: bool = False
+    generation: int = 0
+    last_used: float = 0.0
+    posting_count: int = 0
+
+
+@dataclass
+class _PendingPresignedArbBatch:
+    mode: str
+    plan_key: str
     n_legs_expected: int
     pending: list[tuple[SubmitOrder, Order, float]] = field(default_factory=list)
     created_ts: float = 0.0
@@ -180,6 +232,18 @@ def _parse_arb_batch_tag(tags) -> "tuple[str, int] | None":
             match = ARB_BATCH_TAG_RE.match(tag)
             if match is not None:
                 return match.group("burst_id"), int(match.group("n_legs"))
+    return None
+
+
+def _parse_presigned_arb_tag(tags) -> "tuple[str, str, int] | None":
+    """Return ``(mode, plan_key, n_legs)`` for presigned arb tags."""
+    if not tags:
+        return None
+    for tag in tags:
+        if isinstance(tag, str):
+            match = PRESIGNED_ARB_TAG_RE.match(tag)
+            if match is not None:
+                return match.group("mode"), match.group("plan_key"), int(match.group("n_legs"))
     return None
 
 
@@ -333,6 +397,19 @@ class PolymarketExecutionClient(LiveExecutionClient):
         # ``_queue_arb_batch_order`` / ``_process_arb_batch``.
         self._arb_batch_buffer: dict[str, _PendingArbBatch] = {}
         self._arb_batch_watchdog_ms: int = ARB_BATCH_DEFAULT_WATCHDOG_MS
+        # [fern2 local patch] B2 presigned arb-completion cache. Strategy
+        # sends ensure/refresh requests via a lightweight message-bus endpoint;
+        # fill-time orders carry ``arb_presigned_*`` tags and hit this cache.
+        self._presigned_arb_plans: OrderedDict[str, _PresignedArbPlan] = OrderedDict()
+        self._presigned_arb_buffer: dict[str, _PendingPresignedArbBatch] = {}
+        self._presigned_arb_watchdog_ms: int = ARB_BATCH_DEFAULT_WATCHDOG_MS
+        try:
+            self._msgbus.register(POLYMARKET_PRESIGN_ENDPOINT, self._handle_presign_request)
+        except KeyError:
+            self._log.warning(
+                f"Presign endpoint already registered: {POLYMARKET_PRESIGN_ENDPOINT}",
+                LogColor.YELLOW,
+            )
 
     def calculate_commission(self, instrument, last_qty, last_px, liquidity_side):
         commission = calculate_commission(
@@ -370,6 +447,10 @@ class PolymarketExecutionClient(LiveExecutionClient):
         await self._ws_client.disconnect()
 
     def _stop(self) -> None:
+        try:
+            self._msgbus.deregister(POLYMARKET_PRESIGN_ENDPOINT, self._handle_presign_request)
+        except Exception:
+            pass
         self._retry_manager_pool.shutdown()
 
     async def _maintain_active_market(self, instrument_id: InstrumentId) -> None:
@@ -1496,6 +1577,16 @@ class PolymarketExecutionClient(LiveExecutionClient):
             self._log.warning(f"Order {order} is already closed")
             return
 
+        # [fern2 local patch] B2 presigned arb-completion entrypoint. When a
+        # completion leg carries ``arb_presigned_*`` we try to post the
+        # already-signed payloads from the adapter cache. Misses fall back to
+        # the existing cold sign path below.
+        presigned_info = _parse_presigned_arb_tag(order.tags)
+        if presigned_info is not None:
+            mode, plan_key, n_legs = presigned_info
+            await self._queue_presigned_arb_order(command, order, mode, plan_key, n_legs)
+            return
+
         # [fern2 local patch] Arb-batch coalescing entrypoint. When the order
         # carries an ``arb_batch:<burst_id>:<n_legs>`` tag we buffer it by
         # burst_id and submit all N legs together once the buffer is full
@@ -1632,6 +1723,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         batch.pending.append((command, order, now_ts))
 
         if len(batch.pending) >= batch.n_legs_expected:
+            # Full batch — fire immediately and cancel any pending watchdog.
             if batch.watchdog_task is not None and not batch.watchdog_task.done():
                 batch.watchdog_task.cancel()
             if batch.flushed:
@@ -1640,6 +1732,8 @@ class PolymarketExecutionClient(LiveExecutionClient):
             self._arb_batch_buffer.pop(burst_id, None)
             self.create_task(self._process_arb_batch(batch))
         elif batch.watchdog_task is None:
+            # First leg of an incomplete batch — start the safety watchdog so
+            # a missing/denied leg can't strand the buffer indefinitely.
             batch.watchdog_task = self.create_task(self._arb_batch_watchdog(burst_id))
 
     async def _arb_batch_watchdog(self, burst_id: str) -> None:
@@ -1664,6 +1758,8 @@ class PolymarketExecutionClient(LiveExecutionClient):
         leg_orders: list[Order] = [order for _, order, _ in batch.pending]
         n = len(leg_orders)
 
+        # Anchor for both the per-leg ``init_to_sign_start`` and the batch
+        # ``sign_order_batch`` / ``sign_and_post_order_batch`` timings.
         signing_start = self._clock.timestamp()
         for _command, order, _enq_ts in batch.pending:
             self._log_order_init_to_sign_start(order, "arb_batch", signing_start)
@@ -1673,6 +1769,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
         )
         sign_elapsed = self._clock.timestamp() - signing_start
 
+        # Mirror per-leg ``sign_order`` lines so the existing summarizer's
+        # per-order rollup AND the burst-latency anchors keep working for
+        # batch-submitted legs (all legs share the same elapsed = batch sign
+        # duration; their timestamps are identical, so ``posted_spread``
+        # collapses to ~0 — the visible signal that batching is in effect).
         for order in signed_orders:
             order_type_str = "market" if order.order_type == OrderType.MARKET else "limit"
             self._log.info(
@@ -1703,6 +1804,9 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 ts_event=now_ns,
             )
 
+        # Chunk into ≤15-order sub-batches (Polymarket post_orders cap). For
+        # typical neg-risk events N ≤ ~12 so there's always exactly one chunk;
+        # the chunked path is a defensive fallback for outlier groups.
         chunks: list[tuple[list[Order], list[PostOrdersV2Args], list[VenueOrderId | None]]] = []
         for start in range(0, len(signed_orders), ARB_BATCH_MAX_ORDERS_PER_POST):
             end = start + ARB_BATCH_MAX_ORDERS_PER_POST
@@ -1714,6 +1818,8 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 ),
             )
 
+        # Chunks post concurrently so they all share roughly the same HTTP RTT
+        # — keeps fill→last_posted close to a single round trip even when N>15.
         await asyncio.gather(
             *[
                 self._post_signed_orders_batch(
@@ -1727,6 +1833,8 @@ class PolymarketExecutionClient(LiveExecutionClient):
             ],
         )
 
+        # Mirror per-leg ``sign_and_post_order`` lines (one elapsed value for
+        # the whole batch — same caveat as ``sign_order`` above).
         post_elapsed = self._clock.timestamp() - signing_start
         for order in signed_orders:
             venue_order_id = self._cache.venue_order_id(order.client_order_id)
@@ -1774,6 +1882,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 )
                 continue
             if order.order_type == OrderType.MARKET:
+                # Match the single-order MARKET path: short-GTD marketable limit.
                 poly_order_type = PolyOrderType.GTD
             else:
                 poly_order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
@@ -1789,6 +1898,471 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 ),
             )
         return successfully_signed_orders, signed_orders_args, expected_venue_order_ids
+
+    # ------------------------------------------------------------------ #
+    # [fern2 local patch] B2 presigned arb-completion path.              #
+    # ------------------------------------------------------------------ #
+
+    def _handle_presign_request(self, request: dict) -> None:
+        """Message-bus endpoint used by the strategy to ensure a plan is signed.
+
+        The message bus may call this from a strategy/executor thread, so the
+        actual signing work is scheduled onto the execution client's asyncio
+        loop and never blocks ``process_main``.
+        """
+        try:
+            self._loop.call_soon_threadsafe(
+                lambda: self.create_task(self._ensure_presigned_arb_batch(request)),
+            )
+        except Exception as e:
+            self._log.warning(f"Failed to schedule presign request: {e}", LogColor.YELLOW)
+
+    @staticmethod
+    def _presign_leg_spec_from_dict(raw: dict) -> _PresignedArbLegSpec:
+        return _PresignedArbLegSpec(
+            instrument_id=InstrumentId.from_str(str(raw["instrument_id"])),
+            side=str(raw.get("side", "BUY")).upper(),
+            size=float(raw["size"]),
+            tick_size=str(raw["tick_size"]),
+            neg_risk=bool(raw.get("neg_risk", False)),
+            boundary_price=float(raw["boundary_price"]),
+        )
+
+    @staticmethod
+    def _presign_specs_by_instrument(
+        specs: list[_PresignedArbLegSpec],
+    ) -> dict[InstrumentId, _PresignedArbLegSpec]:
+        return {spec.instrument_id: spec for spec in specs}
+
+    @staticmethod
+    def _presign_live_matches_specs(
+        live: _LivePresignedArbBatch,
+        specs: list[_PresignedArbLegSpec],
+        tolerance: float,
+    ) -> bool:
+        if len(live.leg_specs) != len(specs):
+            return False
+        current_by_iid = PolymarketExecutionClient._presign_specs_by_instrument(specs)
+        for signed_spec in live.leg_specs:
+            current = current_by_iid.get(signed_spec.instrument_id)
+            if current is None:
+                return False
+            if (
+                current.side != signed_spec.side
+                or current.tick_size != signed_spec.tick_size
+                or current.neg_risk != signed_spec.neg_risk
+                or abs(current.boundary_price - signed_spec.boundary_price) > 1e-12
+            ):
+                return False
+            if abs(current.size - signed_spec.size) > tolerance:
+                return False
+        return True
+
+    async def _ensure_presigned_arb_batch(self, request: dict) -> None:
+        if self._rust_client is None:
+            self._log.info(
+                "POLYMARKET_PRESIGN2 miss plan_key="
+                + str(request.get("plan_key", "unknown"))
+                + " reason=no_rust_signer submit_path=prepare",
+                LogColor.CYAN,
+            )
+            return
+
+        plan_key = str(request["plan_key"])
+        leg_specs = [self._presign_leg_spec_from_dict(raw) for raw in request.get("leg_specs", [])]
+        if not leg_specs:
+            return
+
+        now = self._clock.timestamp()
+        effective_ttl_seconds = float(request.get("effective_ttl_seconds", 300))
+        refresh_after_seconds = float(request.get("refresh_after_seconds", 180))
+        stale_after_seconds = float(request.get("stale_after_seconds", 285))
+        size_tolerance = float(request.get("size_tolerance", 1.0))
+        cache_max_plans = int(request.get("cache_max_plans", 256))
+
+        plan = self._presigned_arb_plans.get(plan_key)
+        if plan is None:
+            plan = _PresignedArbPlan(plan_key=plan_key, last_used=now)
+            self._presigned_arb_plans[plan_key] = plan
+        else:
+            plan.last_used = now
+            self._presigned_arb_plans.move_to_end(plan_key)
+
+        live = plan.live
+        if live is not None:
+            age = now - live.signed_at
+            if (
+                age < refresh_after_seconds
+                and self._presign_live_matches_specs(live, leg_specs, size_tolerance)
+            ):
+                self._evict_presign_cache_if_needed(cache_max_plans)
+                return
+
+        if plan.refresh_in_progress:
+            return
+
+        plan.refresh_in_progress = True
+        generation = plan.generation + 1
+        start = self._clock.timestamp()
+        previous_age_ms = None if live is None else max(0.0, (start - live.signed_at) * 1000)
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 prepare_start plan_key={plan_key} "
+            f"n_legs={len(leg_specs)} generation={generation}",
+            LogColor.CYAN,
+        )
+        try:
+            signed_orders_args, expected_venue_order_ids = await self._sign_presigned_arb_legs(
+                leg_specs,
+                effective_ttl_seconds=effective_ttl_seconds,
+            )
+            signed_at = self._clock.timestamp()
+            live_generation = _LivePresignedArbBatch(
+                plan_key=plan_key,
+                leg_specs=list(leg_specs),
+                signed_orders_args=signed_orders_args,
+                expected_venue_order_ids=expected_venue_order_ids,
+                signed_at=signed_at,
+                effective_expires_at=signed_at + effective_ttl_seconds,
+                stale_after_seconds=stale_after_seconds,
+                size_tolerance=size_tolerance,
+                generation=generation,
+            )
+            plan.live = live_generation
+            plan.generation = generation
+            plan.last_used = signed_at
+            self._presigned_arb_plans.move_to_end(plan_key)
+            elapsed_ms = (self._clock.timestamp() - start) * 1000
+            age_ms_text = "none" if previous_age_ms is None else f"{previous_age_ms:.2f}"
+            self._log.info(
+                f"POLYMARKET_PRESIGN2 refresh plan_key={plan_key} "
+                f"age_ms={age_ms_text} elapsed_ms={elapsed_ms:.2f} "
+                f"result=success n_legs={len(leg_specs)} generation={generation} "
+                f"effective_expires_at={live_generation.effective_expires_at:.3f}",
+                LogColor.CYAN,
+            )
+        except Exception as e:
+            elapsed_ms = (self._clock.timestamp() - start) * 1000
+            age_ms_text = "none" if previous_age_ms is None else f"{previous_age_ms:.2f}"
+            self._log.warning(
+                f"POLYMARKET_PRESIGN2 refresh plan_key={plan_key} generation={generation} "
+                f"age_ms={age_ms_text} elapsed_ms={elapsed_ms:.2f} "
+                f"result=failure reason={type(e).__name__}",
+                LogColor.YELLOW,
+            )
+        finally:
+            plan.refresh_in_progress = False
+            self._evict_presign_cache_if_needed(cache_max_plans)
+
+    async def _sign_presigned_arb_legs(
+        self,
+        leg_specs: list[_PresignedArbLegSpec],
+        *,
+        effective_ttl_seconds: float,
+    ) -> tuple[list[PostOrdersV2Args], list[VenueOrderId | None]]:
+        raw_expiration = int(
+            self._clock.timestamp() + POLYMARKET_GTD_SECURITY_BUFFER_SECS + effective_ttl_seconds,
+        )
+
+        async def sign_one(spec: _PresignedArbLegSpec) -> SignedOrderV2:
+            signed_order_json = await self._rust_client.create_order(
+                get_polymarket_token_id(spec.instrument_id),
+                spec.side,
+                spec.size,
+                spec.boundary_price,
+                raw_expiration,
+                float(spec.tick_size),
+                spec.neg_risk,
+            )
+            return self._build_signed_order_v2_from_rust_json(signed_order_json)
+
+        results = await asyncio.gather(
+            *[sign_one(spec) for spec in leg_specs],
+            return_exceptions=True,
+        )
+        signed_orders_args: list[PostOrdersV2Args] = []
+        expected_venue_order_ids: list[VenueOrderId | None] = []
+        errors: list[str] = []
+        for spec, result in zip(leg_specs, results, strict=True):
+            if isinstance(result, BaseException):
+                errors.append(f"{spec.instrument_id}: {result}")
+                continue
+            signed_orders_args.append(PostOrdersV2Args(order=result, orderType=PolyOrderType.GTD))
+            expected_venue_order_ids.append(
+                self._expected_venue_order_id(result, neg_risk=spec.neg_risk),
+            )
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return signed_orders_args, expected_venue_order_ids
+
+    def _evict_presign_cache_if_needed(self, max_plans: int) -> None:
+        if max_plans <= 0:
+            return
+        now = self._clock.timestamp()
+        while len(self._presigned_arb_plans) > max_plans:
+            evict_key = None
+            evict_reason = "lru"
+            for key, plan in self._presigned_arb_plans.items():
+                live = plan.live
+                if plan.posting_count > 0 or plan.refresh_in_progress:
+                    continue
+                if live is None:
+                    evict_key = key
+                    evict_reason = "empty"
+                    break
+                if now - live.signed_at > live.stale_after_seconds:
+                    evict_key = key
+                    evict_reason = "stale"
+                    break
+            if evict_key is None:
+                for key, plan in self._presigned_arb_plans.items():
+                    if plan.posting_count == 0 and not plan.refresh_in_progress:
+                        evict_key = key
+                        break
+            if evict_key is None:
+                return
+            self._presigned_arb_plans.pop(evict_key, None)
+            self._log.info(
+                f"POLYMARKET_PRESIGN2 evict plan_key={evict_key} reason={evict_reason}",
+                LogColor.CYAN,
+            )
+
+    async def _queue_presigned_arb_order(
+        self,
+        command: SubmitOrder,
+        order: Order,
+        mode: str,
+        plan_key: str,
+        n_legs_expected: int,
+    ) -> None:
+        denial_reason = None
+        if order.is_reduce_only:
+            denial_reason = "REDUCE_ONLY_NOT_SUPPORTED"
+        elif order.is_post_only and order.time_in_force not in (TimeInForce.GTC, TimeInForce.GTD):
+            denial_reason = "POST_ONLY_REQUIRES_GTC_OR_GTD"
+        elif order.time_in_force not in VALID_POLYMARKET_TIME_IN_FORCE:
+            denial_reason = "UNSUPPORTED_TIME_IN_FORCE"
+        elif order.is_quote_quantity:
+            denial_reason = "PRESIGNED_ARB_REQUIRES_BASE_QUANTITIES"
+        elif order.order_type not in (OrderType.MARKET, OrderType.LIMIT):
+            denial_reason = "UNSUPPORTED_ORDER_TYPE"
+
+        if denial_reason is not None:
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=denial_reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        buffer_key = f"{mode}:{plan_key}"
+        now_ts = self._clock.timestamp()
+        batch = self._presigned_arb_buffer.get(buffer_key)
+        if batch is None:
+            batch = _PendingPresignedArbBatch(
+                mode=mode,
+                plan_key=plan_key,
+                n_legs_expected=n_legs_expected,
+                created_ts=now_ts,
+            )
+            self._presigned_arb_buffer[buffer_key] = batch
+        batch.pending.append((command, order, now_ts))
+
+        if len(batch.pending) >= batch.n_legs_expected:
+            if batch.watchdog_task is not None and not batch.watchdog_task.done():
+                batch.watchdog_task.cancel()
+            if batch.flushed:
+                return
+            batch.flushed = True
+            self._presigned_arb_buffer.pop(buffer_key, None)
+            self.create_task(self._process_presigned_arb_batch(batch))
+        elif batch.watchdog_task is None:
+            batch.watchdog_task = self.create_task(self._presigned_arb_watchdog(buffer_key))
+
+    async def _presigned_arb_watchdog(self, buffer_key: str) -> None:
+        await asyncio.sleep(self._presigned_arb_watchdog_ms / 1000.0)
+        batch = self._presigned_arb_buffer.pop(buffer_key, None)
+        if batch is None or batch.flushed:
+            return
+        batch.flushed = True
+        self._log.warning(
+            f"Presigned arb watchdog flushing plan_key={batch.plan_key} "
+            f"with {len(batch.pending)}/{batch.n_legs_expected} legs after "
+            f"{self._presigned_arb_watchdog_ms}ms.",
+            LogColor.YELLOW,
+        )
+        await self._process_presigned_arb_batch(batch)
+
+    def _presigned_orders_match_live(
+        self,
+        orders: list[Order],
+        live: _LivePresignedArbBatch,
+    ) -> tuple[bool, str]:
+        if len(orders) != len(live.leg_specs):
+            return False, "n_legs_mismatch"
+        specs_by_iid = PolymarketExecutionClient._presign_specs_by_instrument(live.leg_specs)
+        for order in orders:
+            spec = specs_by_iid.get(order.instrument_id)
+            if spec is None:
+                return False, "plan_mismatch"
+            if order_side_to_str(order.side).upper() != spec.side:
+                return False, "plan_mismatch"
+            if abs(float(order.quantity) - spec.size) > live.size_tolerance:
+                return False, "size_mismatch"
+        return True, "ok"
+
+    def _align_presigned_live_to_orders(
+        self,
+        orders: list[Order],
+        live: _LivePresignedArbBatch,
+    ) -> tuple[list[PostOrdersV2Args], list[VenueOrderId | None]]:
+        index_by_iid = {spec.instrument_id: idx for idx, spec in enumerate(live.leg_specs)}
+        signed_orders_args: list[PostOrdersV2Args] = []
+        expected_venue_order_ids: list[VenueOrderId | None] = []
+        for order in orders:
+            idx = index_by_iid[order.instrument_id]
+            signed_orders_args.append(live.signed_orders_args[idx])
+            expected_venue_order_ids.append(live.expected_venue_order_ids[idx])
+        return signed_orders_args, expected_venue_order_ids
+
+    async def _process_presigned_arb_batch(self, batch: _PendingPresignedArbBatch) -> None:
+        if not batch.pending:
+            return
+
+        orders = [order for _command, order, _enq_ts in batch.pending]
+        plan = self._presigned_arb_plans.get(batch.plan_key)
+        live = plan.live if plan is not None else None
+        reason = None
+        if plan is None:
+            reason = "no_cache"
+        elif live is None:
+            reason = "sign_in_progress" if plan.refresh_in_progress else "no_cache"
+        elif self._clock.timestamp() - live.signed_at > live.stale_after_seconds:
+            reason = "stale"
+        else:
+            matched, match_reason = self._presigned_orders_match_live(orders, live)
+            if not matched:
+                reason = match_reason
+
+        if reason is not None:
+            self._log.info(
+                f"POLYMARKET_PRESIGN2 miss plan_key={batch.plan_key} "
+                f"reason={reason} submit_path=presigned_{batch.mode}",
+                LogColor.CYAN,
+            )
+            await self._fallback_presigned_arb_batch(batch)
+            return
+
+        assert plan is not None and live is not None
+        now = self._clock.timestamp()
+        plan.last_used = now
+        plan.posting_count += 1
+        self._presigned_arb_plans.move_to_end(batch.plan_key)
+        signed_orders_args, expected_venue_order_ids = self._align_presigned_live_to_orders(
+            orders,
+            live,
+        )
+        age_ms = (now - live.signed_at) * 1000
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 hit plan_key={batch.plan_key} age_ms={age_ms:.2f} "
+            f"n_legs={len(orders)} submit_path=presigned_{batch.mode}",
+            LogColor.CYAN,
+        )
+
+        timing_start = self._clock.timestamp()
+        for order in orders:
+            order_type_str = "market" if order.order_type == OrderType.MARKET else "limit"
+            self._log.info(
+                f"POLYMARKET_ORDER_TIMING sign_order client_order_id={order.client_order_id} "
+                f"order_type={order_type_str} signer=presigned elapsed=0.000s "
+                f"plan_key={batch.plan_key} generation={live.generation}",
+                LogColor.BLUE,
+            )
+
+        now_ns = self._clock.timestamp_ns()
+        for order in orders:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=now_ns,
+            )
+
+        try:
+            if batch.mode == "batch":
+                await self._post_signed_orders_batch(
+                    orders,
+                    signed_orders_args,
+                    expected_venue_order_ids,
+                    post_only=False,
+                    timing_start=timing_start,
+                )
+                post_elapsed = self._clock.timestamp() - timing_start
+                for order in orders:
+                    venue_order_id = self._cache.venue_order_id(order.client_order_id)
+                    venue_oid_str = venue_order_id.value if venue_order_id is not None else "unknown"
+                    self._log.info(
+                        "POLYMARKET_ORDER_TIMING sign_and_post_order "
+                        f"client_order_id={order.client_order_id} venue_order_id={venue_oid_str} "
+                        f"elapsed={post_elapsed:.3f}s plan_key={batch.plan_key} generation={live.generation}",
+                        LogColor.BLUE,
+                    )
+            else:
+                await asyncio.gather(
+                    *[
+                        self._post_signed_order(
+                            order,
+                            signed_arg.order,
+                            order_type_override=PolyOrderType.GTD,
+                            expected_venue_order_id=expected_venue_order_id,
+                            timing_start=timing_start,
+                        )
+                        for order, signed_arg, expected_venue_order_id in zip(
+                            orders,
+                            signed_orders_args,
+                            expected_venue_order_ids,
+                            strict=True,
+                        )
+                    ],
+                )
+        finally:
+            plan.posting_count -= 1
+
+    async def _fallback_presigned_arb_batch(self, batch: _PendingPresignedArbBatch) -> None:
+        if batch.mode == "batch":
+            burst_info = _parse_arb_batch_tag(batch.pending[0][1].tags)
+            burst_id = burst_info[0] if burst_info is not None else batch.plan_key
+            await self._process_arb_batch(
+                _PendingArbBatch(
+                    burst_id=burst_id,
+                    n_legs_expected=batch.n_legs_expected,
+                    pending=list(batch.pending),
+                    created_ts=batch.created_ts,
+                    flushed=True,
+                ),
+            )
+            return
+
+        await asyncio.gather(
+            *[self._submit_presigned_fallback_individual(command, order) for command, order, _ in batch.pending],
+        )
+
+    async def _submit_presigned_fallback_individual(self, command: SubmitOrder, order: Order) -> None:
+        instrument = self._cache.instrument(order.instrument_id)
+        if order.order_type == OrderType.MARKET:
+            await self._submit_market_order(command, instrument)
+        elif order.order_type == OrderType.LIMIT:
+            await self._submit_limit_order(command, instrument)
+        else:
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason="UNSUPPORTED_ORDER_TYPE",
+                ts_event=self._clock.timestamp_ns(),
+            )
 
     def _validate_order_for_batch(self, order: Order) -> str | None:
         """
