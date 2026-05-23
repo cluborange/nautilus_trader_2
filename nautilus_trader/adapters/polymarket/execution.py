@@ -2170,6 +2170,9 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             return
 
+        # Current strategy gates should prevent concurrent same-plan bursts.
+        # If execute_one_arb_only/active_arbs semantics change, include a
+        # burst disambiguator in this key to avoid sharing one buffer.
         buffer_key = f"{mode}:{plan_key}"
         now_ts = self._clock.timestamp()
         batch = self._presigned_arb_buffer.get(buffer_key)
