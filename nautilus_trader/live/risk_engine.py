@@ -31,6 +31,22 @@ from nautilus_trader.portfolio.base import PortfolioFacade
 from nautilus_trader.risk.engine import RiskEngine
 
 
+def _arb_completion_client_order_id(command: Command) -> str | None:
+    order = getattr(command, "order", None)
+    tags = getattr(order, "tags", None)
+    if tags is None:
+        return None
+    if not any(
+        isinstance(tag, str) and (tag.startswith("arb_presigned_") or tag.startswith("arb_batch:"))
+        for tag in tags
+    ):
+        return None
+    client_order_id = getattr(order, "client_order_id", None)
+    if client_order_id is None:
+        return None
+    return str(getattr(client_order_id, "value", client_order_id))
+
+
 class LiveRiskEngine(RiskEngine):
     """
     Provides a high-performance asynchronous live risk engine.
@@ -262,7 +278,20 @@ class LiveRiskEngine(RiskEngine):
                     if command is self._sentinel:
                         break
 
+                    pipeline_cid = _arb_completion_client_order_id(command)
+                    if pipeline_cid is not None:
+                        self._log.info(
+                            f"NAUTILUS_PIPELINE risk_received client_order_id={pipeline_cid} "
+                            f"ts_ns={self._clock.timestamp_ns()}",
+                            LogColor.CYAN,
+                        )
                     self._execute_command(command)
+                    if pipeline_cid is not None:
+                        self._log.info(
+                            f"NAUTILUS_PIPELINE risk_done client_order_id={pipeline_cid} "
+                            f"ts_ns={self._clock.timestamp_ns()}",
+                            LogColor.CYAN,
+                        )
                 except asyncio.CancelledError:
                     self._log.warning("Canceled task 'run_cmd_queue'")
                     break

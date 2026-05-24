@@ -1571,6 +1571,23 @@ class PolymarketExecutionClient(LiveExecutionClient):
             await self._retry_manager_pool.release(retry_manager)
 
     async def _submit_order(self, command: SubmitOrder) -> None:
+        # [fern2 local patch] End-to-end pipeline timing anchor. Paired
+        # with the strategy's ``NAUTILUS_PIPELINE strategy_submit`` log so
+        # the summarizer can measure the strategy->adapter gap (Nautilus
+        # risk + exec engines + message bus). Only emitted for orders that
+        # carry an arb-completion tag (``arb_presigned_*`` / ``arb_batch:``)
+        # to avoid the per-line cost on every normal limit re-quote.
+        tags = command.order.tags
+        if tags is not None and any(
+            isinstance(tag, str) and (tag.startswith("arb_presigned_") or tag.startswith("arb_batch:"))
+            for tag in tags
+        ):
+            self._log.info(
+                f"NAUTILUS_PIPELINE adapter_submit client_order_id={command.order.client_order_id} "
+                f"ts_ns={self._clock.timestamp_ns()}",
+                LogColor.CYAN,
+            )
+
         await self._maintain_active_market(command.instrument_id)
 
         order = command.order
@@ -2186,6 +2203,17 @@ class PolymarketExecutionClient(LiveExecutionClient):
             self._presigned_arb_buffer[buffer_key] = batch
         batch.pending.append((command, order, now_ts))
 
+        # [fern2 local patch] Hot-path timing anchor 1/5: leg buffered.
+        # Carries cid + plan_key so the summarizer can join adapter-side
+        # PRESIGN2 stages back to per-burst leg client_order_ids.
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 buffer_add plan_key={plan_key} "
+            f"client_order_id={order.client_order_id} mode={mode} "
+            f"buffered_count={len(batch.pending)} n_legs_expected={n_legs_expected} "
+            f"ts_ns={self._clock.timestamp_ns()}",
+            LogColor.CYAN,
+        )
+
         if len(batch.pending) >= batch.n_legs_expected:
             if batch.watchdog_task is not None and not batch.watchdog_task.done():
                 batch.watchdog_task.cancel()
@@ -2193,6 +2221,14 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 return
             batch.flushed = True
             self._presigned_arb_buffer.pop(buffer_key, None)
+            # [fern2 local patch] Hot-path timing anchor 2/5: buffer reached
+            # n_legs_expected and is about to dispatch _process_presigned_arb_batch.
+            self._log.info(
+                f"POLYMARKET_PRESIGN2 buffer_full plan_key={plan_key} mode={mode} "
+                f"trigger=n_legs n_legs={len(batch.pending)} "
+                f"n_legs_expected={n_legs_expected} ts_ns={self._clock.timestamp_ns()}",
+                LogColor.CYAN,
+            )
             self.create_task(self._process_presigned_arb_batch(batch))
         elif batch.watchdog_task is None:
             batch.watchdog_task = self.create_task(self._presigned_arb_watchdog(buffer_key))
@@ -2208,6 +2244,14 @@ class PolymarketExecutionClient(LiveExecutionClient):
             f"with {len(batch.pending)}/{batch.n_legs_expected} legs after "
             f"{self._presigned_arb_watchdog_ms}ms.",
             LogColor.YELLOW,
+        )
+        # [fern2 local patch] Hot-path timing anchor 2/5 (watchdog branch):
+        # buffer flushed by watchdog timeout, not by reaching n_legs_expected.
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 buffer_full plan_key={batch.plan_key} mode={batch.mode} "
+            f"trigger=watchdog n_legs={len(batch.pending)} "
+            f"n_legs_expected={batch.n_legs_expected} ts_ns={self._clock.timestamp_ns()}",
+            LogColor.CYAN,
         )
         await self._process_presigned_arb_batch(batch)
 
@@ -2244,6 +2288,16 @@ class PolymarketExecutionClient(LiveExecutionClient):
         return signed_orders_args, expected_venue_order_ids
 
     async def _process_presigned_arb_batch(self, batch: _PendingPresignedArbBatch) -> None:
+        # [fern2 local patch] Hot-path timing anchor 3/5: task scheduled by
+        # buffer_full or watchdog has now started running. The gap from the
+        # preceding buffer_full ts_ns measures asyncio.create_task scheduling
+        # latency (often the dominant chunk of the 100+ms hot-path delay).
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 batch_process_enter plan_key={batch.plan_key} mode={batch.mode} "
+            f"n_legs={len(batch.pending)} ts_ns={self._clock.timestamp_ns()}",
+            LogColor.CYAN,
+        )
+
         if not batch.pending:
             return
 
@@ -2269,6 +2323,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 reason = match_reason
 
         if reason is not None:
+            # [fern2 local patch] Hot-path timing anchor 4/5 (miss branch):
+            # plan lookup + validation finished, falling back to cold path.
+            self._log.info(
+                f"POLYMARKET_PRESIGN2 batch_lookup_done plan_key={batch.plan_key} mode={batch.mode} "
+                f"decision=miss reason={reason} ts_ns={self._clock.timestamp_ns()}",
+                LogColor.CYAN,
+            )
             self._log.info(
                 f"POLYMARKET_PRESIGN2 miss plan_key={batch.plan_key} "
                 f"reason={reason} submit_path=presigned_{batch.mode}",
@@ -2287,6 +2348,14 @@ class PolymarketExecutionClient(LiveExecutionClient):
             live,
         )
         age_ms = (now - live.signed_at) * 1000
+        # [fern2 local patch] Hot-path timing anchor 4/5 (hit branch):
+        # plan lookup + validation + alignment finished; about to emit
+        # OrderSubmitted events and POST.
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 batch_lookup_done plan_key={batch.plan_key} mode={batch.mode} "
+            f"decision=hit ts_ns={self._clock.timestamp_ns()}",
+            LogColor.CYAN,
+        )
         self._log.info(
             f"POLYMARKET_PRESIGN2 hit plan_key={batch.plan_key} age_ms={age_ms:.2f} "
             f"n_legs={len(orders)} submit_path=presigned_{batch.mode}",
@@ -2311,6 +2380,16 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 client_order_id=order.client_order_id,
                 ts_event=now_ns,
             )
+
+        # [fern2 local patch] Hot-path timing anchor 5/5: ``post_signed_orders_batch``
+        # / ``asyncio.gather(_post_signed_order)`` about to start. Gap from
+        # batch_lookup_done measures the per-leg sign_order log loop + the
+        # generate_order_submitted loop.
+        self._log.info(
+            f"POLYMARKET_PRESIGN2 batch_post_start plan_key={batch.plan_key} mode={batch.mode} "
+            f"n_legs={len(orders)} ts_ns={self._clock.timestamp_ns()}",
+            LogColor.CYAN,
+        )
 
         try:
             if batch.mode == "batch":
@@ -2670,6 +2749,15 @@ class PolymarketExecutionClient(LiveExecutionClient):
         retry_manager = await self._retry_manager_pool.acquire()
         try:
             client_order_ids = [order.client_order_id for order in orders]
+            if timing_start is not None:
+                elapsed = self._clock.timestamp() - timing_start
+                client_order_ids_text = ",".join(str(order.client_order_id) for order in orders)
+                self._log.info(
+                    "POLYMARKET_ORDER_TIMING post_orders_start "
+                    f"order_count={len(orders)} client_order_ids={client_order_ids_text} "
+                    f"elapsed={elapsed:.3f}s",
+                    LogColor.BLUE,
+                )
             response = await retry_manager.run(
                 "submit_orders_batch",
                 client_order_ids,
@@ -3020,6 +3108,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
             poly_order_type = order_type_override or convert_tif_to_polymarket_order_type(
                 order.time_in_force,
             )
+            if timing_start is not None:
+                elapsed = self._clock.timestamp() - timing_start
+                self._log.info(
+                    "POLYMARKET_ORDER_TIMING post_orders_start "
+                    f"client_order_id={order.client_order_id} elapsed={elapsed:.3f}s",
+                    LogColor.BLUE,
+                )
             response: JSON | None = await retry_manager.run(
                 "submit_order",
                 [order.client_order_id],
