@@ -157,6 +157,9 @@ ARB_BATCH_TAG_RE = re.compile(r"^arb_batch:(?P<burst_id>[a-f0-9]+):(?P<n_legs>\d
 PRESIGNED_ARB_TAG_RE = re.compile(
     r"^arb_presigned_(?P<mode>batch|individual):(?P<plan_key>[a-f0-9]+):(?P<n_legs>\d+)$",
 )
+ARB_COMPLETION_PRICE_CAP_TAG_RE = re.compile(
+    r"^arb_completion_price_cap:(?P<price>\d+(?:\.\d+)?)$",
+)
 ARB_BATCH_DEFAULT_WATCHDOG_MS = 25
 # Polymarket ``post_orders`` accepts at most 15 orders per request.
 ARB_BATCH_MAX_ORDERS_PER_POST = 15
@@ -245,6 +248,18 @@ def _parse_presigned_arb_tag(tags) -> "tuple[str, str, int] | None":
             match = PRESIGNED_ARB_TAG_RE.match(tag)
             if match is not None:
                 return match.group("mode"), match.group("plan_key"), int(match.group("n_legs"))
+    return None
+
+
+def _parse_arb_completion_price_cap(tags) -> float | None:
+    """Return the bounded marketable limit price for arb-completion orders."""
+    if not tags:
+        return None
+    for tag in tags:
+        if isinstance(tag, str):
+            match = ARB_COMPLETION_PRICE_CAP_TAG_RE.match(tag)
+            if match is not None:
+                return float(match.group("price"))
     return None
 
 
@@ -1238,21 +1253,27 @@ class PolymarketExecutionClient(LiveExecutionClient):
         """
         Sign a market order as an aggressive limit via the Rust CLOB client.
 
-        We sign a regular limit at the per-tick-size boundary (max for BUY,
-        min for SELL) with a short GTD expiration. ``order.quantity`` is passed
-        straight through as base-share size for both sides so fills cannot
-        exceed the requested share quantity.
+        Untagged market orders use the per-tick-size boundary (max for BUY,
+        min for SELL). Fern arb-completion orders can carry an explicit
+        ``arb_completion_price_cap`` tag, which is used as the marketable limit
+        price. ``order.quantity`` is passed straight through as base-share size
+        for both sides so fills cannot exceed the requested share quantity.
         """
         min_price, max_price = self._get_min_max_prices(instrument)
         tick_size = float(instrument.price_increment.as_decimal())
         neg_risk = self._get_neg_risk_for_instrument(instrument)
-        price = max_price if order.side == OrderSide.BUY else min_price
+        completion_price_cap = _parse_arb_completion_price_cap(order.tags)
+        if completion_price_cap is not None:
+            price = min(max_price, max(min_price, completion_price_cap))
+        else:
+            price = max_price if order.side == OrderSide.BUY else min_price
         size = float(order.quantity)
 
         self._log.info(
             f"Signing market order as limit via Rust: "
             f"side={order_side_to_str(order.side)} price={price} "
-            f"size={size} tick_size={tick_size}",
+            f"size={size} tick_size={tick_size} "
+            f"arb_completion_cap={completion_price_cap is not None}",
             LogColor.CYAN,
         )
 
@@ -1900,8 +1921,12 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 )
                 continue
             if order.order_type == OrderType.MARKET:
-                # Match the single-order MARKET path: short-GTD marketable limit.
-                poly_order_type = PolyOrderType.GTD
+                # Bounded arb-completion MARKET orders must not rest; post as FAK.
+                poly_order_type = (
+                    PolyOrderType.FAK
+                    if _parse_arb_completion_price_cap(order.tags) is not None
+                    else PolyOrderType.GTD
+                )
             else:
                 poly_order_type = convert_tif_to_polymarket_order_type(order.time_in_force)
             signed_orders_args.append(
@@ -2116,7 +2141,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             if isinstance(result, BaseException):
                 errors.append(f"{spec.instrument_id}: {result}")
                 continue
-            signed_orders_args.append(PostOrdersV2Args(order=result, orderType=PolyOrderType.GTD))
+            signed_orders_args.append(PostOrdersV2Args(order=result, orderType=PolyOrderType.FAK))
             expected_venue_order_ids.append(
                 self._expected_venue_order_id(result, neg_risk=spec.neg_risk),
             )
@@ -2416,7 +2441,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                         self._post_signed_order(
                             order,
                             signed_arg.order,
-                            order_type_override=PolyOrderType.GTD,
+                            order_type_override=PolyOrderType.FAK,
                             expected_venue_order_id=expected_venue_order_id,
                             timing_start=timing_start,
                         )
@@ -2436,6 +2461,10 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             raise
         finally:
+            # Signed Polymarket orders are single-use: even FAK orders that do
+            # not fill may still have been accepted by the API. Force the next
+            # matching plan to refresh instead of reusing the same order hashes.
+            plan.live = None
             plan.posting_count -= 1
 
     async def _fallback_presigned_arb_batch(self, batch: _PendingPresignedArbBatch) -> None:
@@ -3002,9 +3031,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
         await self._post_signed_order(
             order,
             signed_order,
-            order_type_override=PolyOrderType.GTD
-            if self._rust_client is not None
-            else market_order_type,
+            order_type_override=(
+                PolyOrderType.FAK
+                if self._rust_client is not None and _parse_arb_completion_price_cap(order.tags) is not None
+                else PolyOrderType.GTD
+                if self._rust_client is not None
+                else market_order_type
+            ),
             base_quantity=base_quantity,
             expected_venue_order_id=expected_venue_order_id,
             timing_start=signing_start,
