@@ -2258,18 +2258,18 @@ class TestPolymarketExecutionClient:
         assert mock_post_order.call_args.args[1] == "GTD"
 
     @pytest.mark.asyncio
-    async def test_submit_tagged_arb_completion_market_order_uses_cap_and_fak(self, mocker):
+    async def test_submit_tagged_arb_completion_market_order_uses_cap_and_short_gtd(self, mocker):
         """
         Fern arb-completion MARKET orders carry a price-cap tag. The Rust path
-        signs exactly that bounded marketable limit and posts it as FAK so
-        unfilled residuals cannot rest.
+        signs exactly that bounded marketable limit and posts it as short GTD
+        so the exchange preserves exact base-share size semantics.
         """
         rust_client = MagicMock()
         rust_client.create_order = AsyncMock(
             return_value=(
                 '{"salt":1,"maker":"0xmaker","signer":"0xsigner","tokenId":"token",'
                 '"makerAmount":"9000000","takerAmount":"100000000","side":"BUY",'
-                '"expiration":"0","signatureType":0,"timestamp":"1",'
+                '"expiration":"123","signatureType":0,"timestamp":"1",'
                 '"metadata":"0x0000000000000000000000000000000000000000000000000000000000000000",'
                 '"builder":"0x0000000000000000000000000000000000000000000000000000000000000000",'
                 '"signature":"0xsig"}'
@@ -2285,7 +2285,7 @@ class TestPolymarketExecutionClient:
             order_side=OrderSide.BUY,
             quantity=Quantity.from_str("100"),
             time_in_force=TimeInForce.IOC,
-            tags=["0.001", True, "arb_completion_price_cap:0.09"],
+            tags=["0.001", True, "arb_completion_price_cap:0.09", "arb_completion_gtd_seconds:5"],
         )
         self.cache.add_order(market_order, None)
 
@@ -2304,20 +2304,21 @@ class TestPolymarketExecutionClient:
         assert create_order_args[1] == "BUY"
         assert create_order_args[2] == 100.0
         assert create_order_args[3] == 0.09
+        assert 61 <= create_order_args[4] - int(self.exec_client._clock.timestamp()) <= 65
         mock_post_order.assert_called_once()
-        assert mock_post_order.call_args.args[1] == "FAK"
+        assert mock_post_order.call_args.args[1] == "GTD"
 
     @pytest.mark.asyncio
-    async def test_arb_batch_tagged_completion_market_order_uses_cap_and_fak(self):
+    async def test_arb_batch_tagged_completion_market_order_uses_cap_and_short_gtd(self):
         """
-        The non-presign arb batch path also needs bounded FAK semantics.
+        The non-presign arb batch path also needs bounded short-GTD semantics.
         """
         rust_client = MagicMock()
         rust_client.create_order = AsyncMock(
             return_value=(
                 '{"salt":1,"maker":"0xmaker","signer":"0xsigner","tokenId":"token",'
                 '"makerAmount":"9000000","takerAmount":"100000000","side":"BUY",'
-                '"expiration":"0","signatureType":0,"timestamp":"1",'
+                '"expiration":"123","signatureType":0,"timestamp":"1",'
                 '"metadata":"0x0000000000000000000000000000000000000000000000000000000000000000",'
                 '"builder":"0x0000000000000000000000000000000000000000000000000000000000000000",'
                 '"signature":"0xsig"}'
@@ -2329,7 +2330,13 @@ class TestPolymarketExecutionClient:
             order_side=OrderSide.BUY,
             quantity=Quantity.from_str("100"),
             time_in_force=TimeInForce.IOC,
-            tags=["0.001", True, "arb_batch:abcdef12:1", "arb_completion_price_cap:0.09"],
+            tags=[
+                "0.001",
+                True,
+                "arb_batch:abcdef12:1",
+                "arb_completion_price_cap:0.09",
+                "arb_completion_gtd_seconds:5",
+            ],
         )
 
         signed_orders, signed_order_args, expected_venue_order_ids = (
@@ -2340,8 +2347,9 @@ class TestPolymarketExecutionClient:
         assert create_order_args[1] == "BUY"
         assert create_order_args[2] == 100.0
         assert create_order_args[3] == 0.09
+        assert 61 <= create_order_args[4] - int(self.exec_client._clock.timestamp()) <= 65
         assert signed_orders == [market_order]
-        assert signed_order_args[0].orderType == PolyOrderType.FAK
+        assert signed_order_args[0].orderType == PolyOrderType.GTD
         assert len(expected_venue_order_ids) == 1
 
     @pytest.mark.asyncio
