@@ -17,6 +17,7 @@ from typing import Any
 
 import msgspec
 from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import BookParams
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_VENUE
 from nautilus_trader.adapters.polymarket.common.deltas import compute_effective_deltas
@@ -28,6 +29,7 @@ from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_ins
 from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
 from nautilus_trader.adapters.polymarket.config import PolymarketDataClientConfig
 from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProvider
+from nautilus_trader.adapters.polymarket.schemas.book import PolymarketBookLevel
 from nautilus_trader.adapters.polymarket.schemas.book import PolymarketBookSnapshot
 from nautilus_trader.adapters.polymarket.schemas.book import PolymarketQuote
 from nautilus_trader.adapters.polymarket.schemas.book import PolymarketQuotes
@@ -156,7 +158,7 @@ class PolymarketDataClient(LiveMarketDataClient):
             base_url=self._config.base_url_ws,
             channel=PolymarketWebSocketChannel.MARKET,
             handler=self._handle_raw_ws_message,
-            handler_reconnect=None,
+            handler_reconnect=self._handle_ws_reconnect,
             loop=self._loop,
             max_subscriptions_per_connection=self._config.ws_max_subscriptions_per_connection,
             proxy_url=self._config.proxy_url,
@@ -172,6 +174,7 @@ class PolymarketDataClient(LiveMarketDataClient):
         # Hot caches
         self._last_quotes: dict[InstrumentId, QuoteTick] = {}
         self._local_books: dict[InstrumentId, OrderBook] = {}
+        self._rest_snapshot_seeded_instruments: set[InstrumentId] = set()
 
         self._pending_snapshot_after_tick_change: set[InstrumentId] = set()
 
@@ -220,12 +223,20 @@ class PolymarketDataClient(LiveMarketDataClient):
 
     def _schedule_delayed_connect(self) -> None:
         if self._ws_connect_task is not None:
+            self._log.info(
+                "Polymarket delayed websocket connect already scheduled; not scheduling another.",
+                LogColor.YELLOW,
+            )
             return
 
         delay_secs = (
             self._config.ws_connection_initial_delay_secs
             if not self._ws_client.is_connected()
             else self._config.ws_connection_delay_secs
+        )
+        self._log.info(
+            f"Scheduling Polymarket delayed websocket connect in {delay_secs}s",
+            LogColor.BLUE,
         )
         self._ws_connect_task = self.create_task(self._delayed_connect(delay_secs))
 
@@ -234,11 +245,146 @@ class PolymarketDataClient(LiveMarketDataClient):
         await asyncio.sleep(delay_secs)
         self._ws_connect_task = None
         await self._ws_client.connect()
+        await self._seed_current_order_book_snapshots()
+
+    async def _handle_ws_reconnect(self) -> None:
+        self._rest_snapshot_seeded_instruments.clear()
+        await self._seed_current_order_book_snapshots()
+
+    def _ws_subscription_count(self, token_id: str) -> int | None:
+        counts = getattr(self._ws_client, "_subscription_counts", None)
+        if counts is None:
+            return None
+        try:
+            return counts.get(token_id)
+        except Exception:
+            return None
 
     def _create_local_book(self, instrument_id: InstrumentId) -> OrderBook:
         local_book = OrderBook(instrument_id, book_type=BookType.L2_MBP)
         self._local_books[instrument_id] = local_book
         return local_book
+
+    async def _seed_order_book_snapshot(
+        self,
+        instrument_id: InstrumentId,
+        token_id: str,
+    ) -> None:
+        # [fern2 local patch] Dynamic Polymarket websocket subscriptions can
+        # arrive without a fresh book snapshot, leaving the Nautilus local book
+        # one-sided until that side changes. Seed from CLOB REST once per
+        # subscription so strategies can quote immediately from a complete book.
+        if instrument_id in self._rest_snapshot_seeded_instruments:
+            return
+
+        instrument = self._cache.instrument(instrument_id)
+        if instrument is None:
+            return
+
+        self._rest_snapshot_seeded_instruments.add(instrument_id)
+        try:
+            raw_book = await self._loop.run_in_executor(
+                None,
+                self._http_client.get_order_book,
+                token_id,
+            )
+            snapshot = self._parse_rest_book_snapshot(raw_book)
+            self._handle_book_snapshot(instrument=instrument, ws_message=snapshot)
+            self._log.debug(f"Seeded order book snapshot for {instrument_id} from REST")
+        except Exception as e:
+            self._rest_snapshot_seeded_instruments.discard(instrument_id)
+            self._log.warning(f"Failed to seed order book snapshot for {instrument_id}: {e!r}")
+
+    async def _seed_current_order_book_snapshots(self) -> None:
+        pairs = [
+            (instrument_id, get_polymarket_token_id(instrument_id))
+            for instrument_id in list(self._local_books)
+            if instrument_id not in self._rest_snapshot_seeded_instruments
+            and self._cache.instrument(instrument_id) is not None
+        ]
+        if not pairs:
+            return
+
+        self._log.info(
+            f"Seeding {len(pairs)} Polymarket order book snapshot(s) from REST",
+            LogColor.BLUE,
+        )
+        chunk_size = 100
+        for index in range(0, len(pairs), chunk_size):
+            await self._seed_order_book_snapshot_batch(pairs[index : index + chunk_size])
+
+    async def _seed_order_book_snapshot_batch(
+        self,
+        pairs: list[tuple[InstrumentId, str]],
+    ) -> None:
+        pairs = [
+            (instrument_id, token_id)
+            for instrument_id, token_id in pairs
+            if instrument_id not in self._rest_snapshot_seeded_instruments
+        ]
+        if not pairs:
+            return
+
+        for instrument_id, _ in pairs:
+            self._rest_snapshot_seeded_instruments.add(instrument_id)
+
+        try:
+            raw_books = await self._loop.run_in_executor(
+                None,
+                self._http_client.get_order_books,
+                [BookParams(token_id=token_id) for _, token_id in pairs],
+            )
+            if isinstance(raw_books, dict) and "data" in raw_books:
+                raw_books = raw_books["data"]
+            raw_books_by_token = {
+                str(self._raw_book_get(raw_book, "asset_id")): raw_book
+                for raw_book in raw_books
+            }
+            for instrument_id, token_id in pairs:
+                raw_book = raw_books_by_token.get(token_id)
+                instrument = self._cache.instrument(instrument_id)
+                if raw_book is None or instrument is None:
+                    self._rest_snapshot_seeded_instruments.discard(instrument_id)
+                    continue
+                snapshot = self._parse_rest_book_snapshot(raw_book)
+                self._handle_book_snapshot(instrument=instrument, ws_message=snapshot)
+        except Exception as e:
+            for instrument_id, _ in pairs:
+                self._rest_snapshot_seeded_instruments.discard(instrument_id)
+            self._log.warning(f"Failed to seed order book snapshots from REST: {e!r}")
+
+    @staticmethod
+    def _raw_book_get(raw_book: Any, key: str, default: Any = None) -> Any:
+        if isinstance(raw_book, dict):
+            return raw_book.get(key, default)
+        return getattr(raw_book, key, default)
+
+    @staticmethod
+    def _parse_rest_book_snapshot(raw_book: Any) -> PolymarketBookSnapshot:
+        def parse_level(raw_level: Any) -> PolymarketBookLevel:
+            if isinstance(raw_level, PolymarketBookLevel):
+                return raw_level
+            if isinstance(raw_level, dict):
+                price = raw_level["price"]
+                size = raw_level["size"]
+            else:
+                price = raw_level.price
+                size = raw_level.size
+            return PolymarketBookLevel(price=str(price), size=str(size))
+
+        return PolymarketBookSnapshot(
+            market=str(PolymarketDataClient._raw_book_get(raw_book, "market")),
+            asset_id=str(PolymarketDataClient._raw_book_get(raw_book, "asset_id")),
+            bids=[
+                parse_level(level)
+                for level in PolymarketDataClient._raw_book_get(raw_book, "bids", [])
+            ],
+            asks=[
+                parse_level(level)
+                for level in PolymarketDataClient._raw_book_get(raw_book, "asks", [])
+            ],
+            timestamp=str(PolymarketDataClient._raw_book_get(raw_book, "timestamp")),
+        )
 
     def _cleanup_expired_books(self) -> None:
         now_ns = self._clock.timestamp_ns()
@@ -373,6 +519,10 @@ class PolymarketDataClient(LiveMarketDataClient):
         for instrument_id, future in pending.items():
             instrument = self._instrument_provider.find(instrument_id)
             if instrument is not None:
+                # LiveDataEngine may process the published instrument after the
+                # awaiting subscribe coroutine resumes; make the cache visible
+                # before resolving the auto-load future.
+                self._cache.add_instrument(instrument)
                 self._handle_data(instrument)
 
                 if not future.done():
@@ -425,38 +575,124 @@ class PolymarketDataClient(LiveMarketDataClient):
             return
 
         if not await self._ensure_instrument_loaded(command.instrument_id):
+            self._log.info(
+                f"Polymarket order book subscribe early return for {command.instrument_id}: "
+                "ensure_instrument_loaded=False "
+                f"cache_has_instrument={self._cache.instrument(command.instrument_id) is not None} "
+                f"disconnecting={self._disconnecting}",
+                LogColor.YELLOW,
+            )
             return
 
-        if command.instrument_id not in self.subscribed_order_book_deltas():
+        subscribed_order_books = self.subscribed_order_book_deltas()
+        if command.instrument_id not in subscribed_order_books:
+            self._log.info(
+                f"Polymarket order book subscribe early return for {command.instrument_id}: "
+                "engine subscription no longer active after instrument load "
+                f"subscribed_order_books={len(subscribed_order_books)} "
+                f"cache_has_instrument={self._cache.instrument(command.instrument_id) is not None} "
+                f"local_book_exists={command.instrument_id in self._local_books} "
+                f"ws_connected={self._ws_client.is_connected()}",
+                LogColor.YELLOW,
+            )
             return
 
         if command.instrument_id not in self._local_books:
             self._create_local_book(command.instrument_id)
+            self._log.info(
+                f"Polymarket order book subscribe created local book for {command.instrument_id}",
+                LogColor.BLUE,
+            )
 
         token_id = get_polymarket_token_id(command.instrument_id)
 
         if self._ws_client.is_connected():
+            self._log.info(
+                f"Polymarket order book subscribe reaching connected WS path for {command.instrument_id}: "
+                f"token={token_id} ws_count_before={self._ws_subscription_count(token_id)}",
+                LogColor.BLUE,
+            )
             await self._ws_client.subscribe(token_id)
+            self._log.info(
+                f"Polymarket order book subscribe completed WS subscribe for {command.instrument_id}: "
+                f"token={token_id} ws_count_after={self._ws_subscription_count(token_id)}; seeding REST snapshot",
+                LogColor.BLUE,
+            )
+            await self._seed_order_book_snapshot(command.instrument_id, token_id)
         else:
+            self._log.info(
+                f"Polymarket order book subscribe reaching queued WS path for {command.instrument_id}: "
+                f"token={token_id} ws_count_before={self._ws_subscription_count(token_id)} "
+                f"connect_task_exists={self._ws_connect_task is not None}",
+                LogColor.BLUE,
+            )
             self._ws_client.add_subscription(token_id)
+            self._log.info(
+                f"Polymarket order book subscribe queued token for {command.instrument_id}: "
+                f"token={token_id} ws_count_after={self._ws_subscription_count(token_id)}",
+                LogColor.BLUE,
+            )
             self._schedule_delayed_connect()
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         if not await self._ensure_instrument_loaded(command.instrument_id):
+            self._log.info(
+                f"Polymarket quote tick subscribe early return for {command.instrument_id}: "
+                "ensure_instrument_loaded=False "
+                f"cache_has_instrument={self._cache.instrument(command.instrument_id) is not None} "
+                f"disconnecting={self._disconnecting}",
+                LogColor.YELLOW,
+            )
             return
 
-        if command.instrument_id not in self.subscribed_quote_ticks():
+        subscribed_quotes = self.subscribed_quote_ticks()
+        if command.instrument_id not in subscribed_quotes:
+            self._log.info(
+                f"Polymarket quote tick subscribe early return for {command.instrument_id}: "
+                "engine subscription no longer active after instrument load "
+                f"subscribed_quotes={len(subscribed_quotes)} "
+                f"cache_has_instrument={self._cache.instrument(command.instrument_id) is not None} "
+                f"local_book_exists={command.instrument_id in self._local_books} "
+                f"ws_connected={self._ws_client.is_connected()}",
+                LogColor.YELLOW,
+            )
             return
 
         if command.instrument_id not in self._local_books:
             self._create_local_book(command.instrument_id)
+            self._log.info(
+                f"Polymarket quote tick subscribe created local book for {command.instrument_id}",
+                LogColor.BLUE,
+            )
 
         token_id = get_polymarket_token_id(command.instrument_id)
 
         if self._ws_client.is_connected():
+            self._log.info(
+                f"Polymarket quote tick subscribe reaching connected WS path for {command.instrument_id}: "
+                f"token={token_id} ws_count_before={self._ws_subscription_count(token_id)}",
+                LogColor.BLUE,
+            )
             await self._ws_client.subscribe(token_id)
+            self._log.info(
+                f"Polymarket quote tick subscribe completed WS subscribe for {command.instrument_id}: "
+                f"token={token_id} ws_count_after={self._ws_subscription_count(token_id)}; seeding REST snapshot",
+                LogColor.BLUE,
+            )
+            await self._seed_order_book_snapshot(command.instrument_id, token_id)
         else:
+            self._log.info(
+                f"Polymarket quote tick subscribe reaching queued WS path for {command.instrument_id}: "
+                f"token={token_id} ws_count_before={self._ws_subscription_count(token_id)} "
+                f"connect_task_exists={self._ws_connect_task is not None}",
+                LogColor.BLUE,
+            )
             self._ws_client.add_subscription(token_id)
+            self._log.info(
+                f"Polymarket quote tick subscribe queued token for {command.instrument_id}: "
+                f"token={token_id} ws_count_after={self._ws_subscription_count(token_id)}",
+                LogColor.BLUE,
+            )
             self._schedule_delayed_connect()
 
     async def _subscribe_trade_ticks(self, command: SubscribeTradeTicks) -> None:
@@ -497,6 +733,7 @@ class PolymarketDataClient(LiveMarketDataClient):
             and instrument_id not in self.subscribed_quote_ticks()
         ):
             self._pending_snapshot_after_tick_change.discard(instrument_id)
+            self._rest_snapshot_seeded_instruments.discard(instrument_id)
             self._local_books.pop(instrument_id, None)
             self._last_quotes.pop(instrument_id, None)
 
@@ -824,6 +1061,7 @@ class PolymarketDataClient(LiveMarketDataClient):
         # docs/integrations/polymarket.md.
         self._local_books.pop(instrument.id, None)
         self._last_quotes.pop(instrument.id, None)
+        self._rest_snapshot_seeded_instruments.discard(instrument.id)
 
         if (
             instrument.id in self.subscribed_order_book_deltas()
