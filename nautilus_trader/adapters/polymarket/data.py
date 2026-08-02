@@ -247,9 +247,23 @@ class PolymarketDataClient(LiveMarketDataClient):
         await self._ws_client.connect()
         await self._seed_current_order_book_snapshots()
 
-    async def _handle_ws_reconnect(self) -> None:
-        self._rest_snapshot_seeded_instruments.clear()
-        await self._seed_current_order_book_snapshots()
+    async def _handle_ws_reconnect(self, client_id: int | None = None) -> None:
+        if client_id is None:
+            # Preserve the full-reseed fallback for callers without shard
+            # identity (including older USER-channel integrations).
+            self._rest_snapshot_seeded_instruments.clear()
+            await self._seed_current_order_book_snapshots()
+            return
+
+        shard_tokens = set(self._ws_client.subscriptions_for_client(client_id))
+        shard_instruments = [
+            instrument_id
+            for instrument_id in self._local_books
+            if get_polymarket_token_id(instrument_id) in shard_tokens
+        ]
+        for instrument_id in shard_instruments:
+            self._rest_snapshot_seeded_instruments.discard(instrument_id)
+        await self._seed_current_order_book_snapshots(shard_instruments)
 
     def _ws_subscription_count(self, token_id: str) -> int | None:
         counts = getattr(self._ws_client, "_subscription_counts", None)
@@ -295,10 +309,14 @@ class PolymarketDataClient(LiveMarketDataClient):
             self._rest_snapshot_seeded_instruments.discard(instrument_id)
             self._log.warning(f"Failed to seed order book snapshot for {instrument_id}: {e!r}")
 
-    async def _seed_current_order_book_snapshots(self) -> None:
+    async def _seed_current_order_book_snapshots(
+        self,
+        instrument_ids: list[InstrumentId] | None = None,
+    ) -> None:
+        candidates = list(self._local_books) if instrument_ids is None else instrument_ids
         pairs = [
             (instrument_id, get_polymarket_token_id(instrument_id))
-            for instrument_id in list(self._local_books)
+            for instrument_id in candidates
             if instrument_id not in self._rest_snapshot_seeded_instruments
             and self._cache.instrument(instrument_id) is not None
         ]

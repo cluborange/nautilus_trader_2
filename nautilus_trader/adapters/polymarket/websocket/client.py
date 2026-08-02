@@ -152,6 +152,10 @@ class PolymarketWebSocketClient:
         """
         return bool(self._subscriptions)
 
+    def subscriptions_for_client(self, client_id: int) -> list[str]:
+        """Return a copy of the subscriptions assigned to one websocket shard."""
+        return self._client_subscriptions.get(client_id, []).copy()
+
     def is_connected(self) -> bool:
         """
         Return whether any client is connected.
@@ -444,7 +448,7 @@ class PolymarketWebSocketClient:
         self._tasks.add(task)
 
         if self._handler_reconnect:
-            task = self._loop.create_task(self._handler_reconnect())  # type: ignore
+            task = self._loop.create_task(self._handler_reconnect(client_id))
             self._tasks.add(task)
 
     async def disconnect(self) -> None:
